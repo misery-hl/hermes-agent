@@ -80,6 +80,40 @@ def test_ssh_backend_without_host_or_user_logs_and_returns_false(monkeypatch, ca
     )
 
 
+def test_docker_backend_schema_check_only_requires_cli(monkeypatch):
+    _clear_terminal_env(monkeypatch)
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+
+    import tools.environments.docker as docker_env
+
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+
+    def _fail_run(*_args, **_kwargs):
+        raise AssertionError("docker daemon probe should not run during schema check")
+
+    monkeypatch.setattr(terminal_tool_module.subprocess, "run", _fail_run)
+
+    assert terminal_tool_module.check_terminal_requirements() is True
+
+
+def test_docker_backend_without_cli_returns_false(monkeypatch, caplog):
+    _clear_terminal_env(monkeypatch)
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+
+    import tools.environments.docker as docker_env
+
+    monkeypatch.setattr(docker_env, "find_docker", lambda: None)
+
+    with caplog.at_level(logging.ERROR):
+        ok = terminal_tool_module.check_terminal_requirements()
+
+    assert ok is False
+    assert any(
+        "Docker executable not found" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def test_modal_backend_without_token_or_config_logs_specific_error(monkeypatch, caplog, tmp_path):
     _clear_terminal_env(monkeypatch)
     monkeypatch.setenv("TERMINAL_ENV", "modal")

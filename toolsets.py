@@ -54,6 +54,9 @@ _HERMES_CORE_TOOLS = [
     "clarify",
     # Code execution + delegation
     "execute_code", "delegate_task",
+    # Host-side Google Drive boundary wrapper for restaurant workers
+    "google_drive_boundary_list", "google_drive_boundary_check",
+    "google_drive_boundary_metadata", "google_drive_boundary_download",
     # Cronjob management
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
@@ -227,6 +230,21 @@ TOOLSETS = {
             "kanban_show", "kanban_complete", "kanban_block",
             "kanban_heartbeat", "kanban_comment",
             "kanban_create", "kanban_link",
+        ],
+        "includes": [],
+    },
+
+    "google_drive_boundary": {
+        "description": (
+            "Host-side Google Drive allowlist wrapper for restaurant workers. "
+            "Keeps OAuth token/client files out of restaurant containers and "
+            "enforces configured Drive root ancestry before metadata/list/content access."
+        ),
+        "tools": [
+            "google_drive_boundary_list",
+            "google_drive_boundary_check",
+            "google_drive_boundary_metadata",
+            "google_drive_boundary_download",
         ],
         "includes": [],
     },

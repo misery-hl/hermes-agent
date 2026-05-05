@@ -258,16 +258,18 @@ def _ensure_docker_available() -> None:
         raise
     else:
         if result.returncode != 0:
+            stderr = result.stderr.strip()
             logger.error(
                 "Docker backend selected but '%s version' failed "
                 "(exit code %d, stderr=%s)",
                 docker_exe,
                 result.returncode,
-                result.stderr.strip(),
+                stderr,
             )
             raise RuntimeError(
                 "Docker command is available but 'docker version' failed. "
                 "Check your Docker installation."
+                + (f" stderr: {stderr}" if stderr else "")
             )
 
 

@@ -2128,8 +2128,14 @@ def check_terminal_requirements() -> bool:
             if not docker:
                 logger.error("Docker executable not found in PATH or common install locations")
                 return False
-            result = subprocess.run([docker, "version"], capture_output=True, timeout=5)
-            return result.returncode == 0
+            # Tool schema availability should only require the Docker CLI to be
+            # present. The Docker daemon/socket check still happens when a
+            # DockerEnvironment is actually created, where the user gets the
+            # real stderr. Doing the daemon probe here made terminal/file tools
+            # disappear entirely from long-lived workers after transient Docker
+            # Desktop or group-membership issues, leaving them with only
+            # execute_code and a much worse diagnostic.
+            return True
 
         elif env_type == "singularity":
             executable = shutil.which("apptainer") or shutil.which("singularity")
