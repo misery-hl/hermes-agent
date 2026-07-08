@@ -95,6 +95,12 @@ STT_MULTIPART_OVERHEAD_BYTES = 128 * 1024
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+PGA_AMAZON_MCP_DIR = "/home/clockwork/clockwork-amazon-mcp"
+PGA_ITEMS_JSON = "/home/clockwork/restaurants/pga/structured-memory/items.json"
+PGA_AMAZON_EVIDENCE_DIR = "/home/clockwork/restaurants/pga/orders/amazon-cart-evidence"
+PGA_AMAZON_USER_DATA_DIR = "/home/clockwork/.local/share/clockwork-amazon-mcp/pga-amazon"
+PGA_AMAZON_WINDOWS_CDP_PORT = "9233"
+PGA_AMAZON_CART_TIMEOUT_SECONDS = 180.0
 
 _AUDIO_MIME_EXTENSIONS = {
     "audio/aac": ".aac",
@@ -796,6 +802,8 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        self._pga_order_cart_tasks: set["asyncio.Task"] = set()
+        self._pga_order_cart_tasks_by_submission: dict[str, "asyncio.Task"] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
 
     @staticmethod
@@ -1199,6 +1207,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "skills_api": True,
                 "audio_api": False,
                 "audio_transcription": True,
+                "pga_order_intake": True,
                 "realtime_voice": False,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
@@ -1227,8 +1236,410 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
                 "audio_transcribe": {"method": "POST", "path": "/api/audio/transcribe"},
+                "pga_order_catalog": {"method": "GET", "path": "/v1/pga/order/catalog"},
+                "pga_order_submissions": {"method": "POST", "path": "/v1/pga/order/submissions"},
+                "pga_order_submission": {"method": "GET", "path": "/v1/pga/order/submissions/{submission_id}"},
+                "pga_order_amazon_cart": {"method": "POST", "path": "/v1/pga/order/submissions/{submission_id}/amazon-cart"},
             },
         })
+
+    def _pga_order_intake_profile_ok(self) -> bool:
+        """Return true only for the isolated PGA profile runtime."""
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            profile_name = get_active_profile_name()
+            if profile_name:
+                return profile_name == "pga"
+        except Exception:
+            pass
+
+        try:
+            from hermes_constants import get_hermes_home
+
+            hermes_home = Path(get_hermes_home()).expanduser().resolve()
+        except Exception:
+            hermes_home = Path(os.environ.get("HERMES_HOME", "")).expanduser().resolve()
+
+        return hermes_home.name == "pga" and hermes_home.parent.name == "profiles"
+
+    def _pga_order_intake_module(self) -> tuple[Optional[Any], Optional["web.Response"]]:
+        """Load the profile-owned PGA order intake module without widening core tools."""
+        if not self._pga_order_intake_profile_ok():
+            return None, web.json_response(
+                {"ok": False, "error": "pga_order_intake_unavailable", "message": "PGA order intake is unavailable."},
+                status=404,
+            )
+
+        try:
+            from hermes_constants import get_hermes_home
+
+            hermes_home = Path(get_hermes_home()).expanduser().resolve()
+        except Exception:
+            hermes_home = Path(os.environ.get("HERMES_HOME", "")).expanduser().resolve()
+
+        plugin_dir = hermes_home / "plugins" / "restaurant-output"
+        package_file = plugin_dir / "__init__.py"
+        intake_file = plugin_dir / "intake.py"
+        if not package_file.exists() or not intake_file.exists():
+            return None, web.json_response(
+                {"ok": False, "error": "pga_order_intake_unavailable", "message": "PGA order intake is unavailable."},
+                status=503,
+            )
+
+        try:
+            import importlib
+            import importlib.util
+            import sys
+
+            digest = hashlib.sha1(str(plugin_dir).encode("utf-8")).hexdigest()[:16]
+            package_name = f"_pga_restaurant_output_{digest}"
+            if package_name not in sys.modules:
+                spec = importlib.util.spec_from_file_location(
+                    package_name,
+                    package_file,
+                    submodule_search_locations=[str(plugin_dir)],
+                )
+                if spec is None or spec.loader is None:
+                    raise RuntimeError("restaurant-output plugin is not importable")
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[package_name] = module
+                spec.loader.exec_module(module)
+            return importlib.import_module(f"{package_name}.intake"), None
+        except Exception:
+            logger.exception("[api_server] failed to load PGA order intake module")
+            return None, web.json_response(
+                {"ok": False, "error": "pga_order_intake_unavailable", "message": "PGA order intake is unavailable."},
+                status=503,
+            )
+
+    def _pga_order_intake_exception_response(self, exc: Exception) -> "web.Response":
+        code = getattr(exc, "code", "pga_order_intake_failed")
+        message = getattr(exc, "public_message", None) or "PGA order intake failed."
+        status = 400 if code not in {"pga_order_intake_failed", "catalog_invalid"} else 500
+        return web.json_response({"ok": False, "error": code, "message": message}, status=status)
+
+    def _pga_order_has_amazon_cart_plan(self, result: dict[str, Any]) -> bool:
+        vendor_outputs = result.get("vendorOutputs")
+        if not isinstance(vendor_outputs, list):
+            return False
+        for row in vendor_outputs:
+            if not isinstance(row, dict):
+                continue
+            if (
+                row.get("output_type") == "amazon_cart"
+                and row.get("mcp_tool") == "prepare_cart"
+                and isinstance(row.get("mcp_request"), dict)
+            ):
+                return True
+        return False
+
+    def _pga_existing_amazon_cart_status(self, intake: Any, submission_id: str) -> Optional[dict[str, Any]]:
+        getter = getattr(intake, "get_submission_status", None)
+        if not callable(getter):
+            return None
+        try:
+            status = getter(submission_id)
+        except Exception:
+            return None
+        if not isinstance(status, dict):
+            return None
+        amazon_cart = status.get("amazonCart")
+        if isinstance(amazon_cart, dict) and amazon_cart.get("status") in {
+            "amazon_cart_prepared",
+            "amazon_cart_already_prepared",
+        }:
+            return amazon_cart
+        vendor_outputs = status.get("vendorOutputs")
+        if isinstance(vendor_outputs, list):
+            for row in vendor_outputs:
+                if not isinstance(row, dict):
+                    continue
+                if row.get("output_type") == "amazon_cart" and row.get("status") in {
+                    "amazon_cart_prepared",
+                    "amazon_cart_already_prepared",
+                }:
+                    return {
+                        "ok": True,
+                        "status": row.get("status"),
+                        "cartStatus": row.get("cart_status"),
+                        "vendorId": row.get("vendor_id"),
+                        "mode": row.get("mode"),
+                        "cartMutationPerformed": row.get("cart_mutation_performed") is True,
+                        "statusPersisted": True,
+                        "noCheckout": row.get("no_checkout") is True,
+                        "noPurchaseMade": row.get("no_purchase_made") is True,
+                        "noPaymentSet": row.get("no_payment_set") is True,
+                        "noAddressSet": row.get("no_address_set") is True,
+                    }
+        return None
+
+    def _start_pga_amazon_cart_prepare(
+        self,
+        intake: Any,
+        submission_id: str,
+        payload: Optional[dict[str, Any]] = None,
+    ) -> tuple["asyncio.Task", bool]:
+        existing = self._pga_order_cart_tasks_by_submission.get(submission_id)
+        if existing is not None and not existing.done():
+            return existing, False
+
+        task = asyncio.create_task(self._prepare_pga_amazon_cart_from_submission(intake, submission_id, payload))
+        self._pga_order_cart_tasks.add(task)
+        self._pga_order_cart_tasks_by_submission[submission_id] = task
+
+        def _done(done: "asyncio.Task") -> None:
+            self._pga_order_cart_tasks.discard(done)
+            if self._pga_order_cart_tasks_by_submission.get(submission_id) is done:
+                self._pga_order_cart_tasks_by_submission.pop(submission_id, None)
+            try:
+                done.result()
+            except Exception:
+                logger.exception("[api_server] PGA Amazon cart preparation failed in background")
+
+        task.add_done_callback(_done)
+        return task, True
+
+    def _queue_pga_amazon_cart_prepare(self, intake: Any, submission_id: str) -> dict[str, Any]:
+        existing_status = self._pga_existing_amazon_cart_status(intake, submission_id)
+        if existing_status is not None:
+            return {
+                "ok": True,
+                "status": existing_status.get("status", "amazon_cart_prepared"),
+                "submissionId": submission_id,
+                "async": False,
+                "queued": False,
+                "cartOnlyLive": True,
+                "dispatchDryRun": True,
+                "statusPersisted": existing_status.get("statusPersisted") is True,
+                "noCheckout": True,
+                "noPurchaseMade": True,
+                "noPaymentSet": True,
+                "noAddressSet": True,
+            }
+        _task, created = self._start_pga_amazon_cart_prepare(intake, submission_id)
+        return {
+            "ok": True,
+            "status": "amazon_cart_prepare_queued" if created else "amazon_cart_prepare_in_progress",
+            "submissionId": submission_id,
+            "async": True,
+            "queued": created,
+            "cartOnlyLive": True,
+            "dispatchDryRun": True,
+            "noCheckout": True,
+            "noPurchaseMade": True,
+            "noPaymentSet": True,
+            "noAddressSet": True,
+        }
+
+    async def _prepare_pga_amazon_cart_from_submission(
+        self,
+        intake: Any,
+        submission_id: str,
+        payload: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        plan = intake.prepare_amazon_cart_from_submission(
+            submission_id,
+            payload or {"confirm_cart_mutation": True},
+        )
+        mcp_request = plan.get("mcpRequest")
+        if not isinstance(mcp_request, dict):
+            raise RuntimeError("PGA Amazon cart plan did not include an MCP request")
+
+        cart_result = await self._execute_pga_amazon_prepare_cart(mcp_request)
+        persisted: dict[str, Any] | None = None
+        recorder = getattr(intake, "record_amazon_cart_prepare_result", None)
+        if callable(recorder):
+            persisted = recorder(
+                submission_id,
+                cart_result,
+                mcp_request=mcp_request,
+            )
+
+        return {
+            "ok": cart_result.get("ok") is True,
+            "status": "amazon_cart_prepared" if cart_result.get("ok") is True else "amazon_cart_prepare_failed",
+            "submissionId": submission_id,
+            "vendorId": plan.get("vendorId"),
+            "mcpServer": plan.get("mcpServer"),
+            "mcpTool": plan.get("mcpTool"),
+            "lineCount": plan.get("lineCount"),
+            "unitCount": plan.get("unitCount"),
+            "cartResult": cart_result,
+            "statusPersisted": bool(persisted and persisted.get("statusPersisted") is True),
+            "noCheckout": True,
+            "noPurchaseMade": True,
+            "noPaymentSet": True,
+            "noAddressSet": True,
+        }
+
+    async def _execute_pga_amazon_prepare_cart(self, mcp_request: dict[str, Any]) -> dict[str, Any]:
+        repo_dir = Path(os.environ.get("PGA_AMAZON_MCP_DIR", PGA_AMAZON_MCP_DIR)).expanduser().resolve()
+        if not repo_dir.is_dir():
+            return {
+                "ok": False,
+                "status": "unavailable",
+                "no_purchase_made": True,
+                "confidence": "low",
+                "reason": "Amazon MCP repository is unavailable.",
+            }
+
+        request_json = json.dumps(mcp_request, ensure_ascii=False, separators=(",", ":"))
+        env = os.environ.copy()
+        env["CLOCKWORK_ITEMS_JSON"] = os.environ.get("CLOCKWORK_ITEMS_JSON", PGA_ITEMS_JSON)
+        env["AMAZON_WINDOWS_CDP_PORT"] = os.environ.get("AMAZON_WINDOWS_CDP_PORT", PGA_AMAZON_WINDOWS_CDP_PORT)
+        env["AMAZON_EVIDENCE_DIR"] = os.environ.get("AMAZON_EVIDENCE_DIR", PGA_AMAZON_EVIDENCE_DIR)
+        env["AMAZON_USER_DATA_DIR"] = os.environ.get("AMAZON_USER_DATA_DIR", PGA_AMAZON_USER_DATA_DIR)
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "npm",
+                "--silent",
+                "run",
+                "amazon:windows-prepare-cart",
+                "--",
+                request_json,
+                cwd=str(repo_dir),
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=PGA_AMAZON_CART_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            return {
+                "ok": False,
+                "status": "unavailable",
+                "no_purchase_made": True,
+                "confidence": "low",
+                "reason": "Amazon cart preparation timed out.",
+            }
+        except Exception:
+            logger.exception("[api_server] failed to launch PGA Amazon cart preparation")
+            return {
+                "ok": False,
+                "status": "unavailable",
+                "no_purchase_made": True,
+                "confidence": "low",
+                "reason": "Amazon cart preparation could not start.",
+            }
+
+        try:
+            parsed = json.loads(stdout.decode("utf-8"))
+        except Exception:
+            logger.warning("[api_server] Amazon cart preparation returned invalid JSON")
+            return {
+                "ok": False,
+                "status": "unavailable",
+                "no_purchase_made": True,
+                "confidence": "low",
+                "reason": "Amazon cart preparation returned invalid output.",
+            }
+
+        if not isinstance(parsed, dict):
+            return {
+                "ok": False,
+                "status": "unavailable",
+                "no_purchase_made": True,
+                "confidence": "low",
+                "reason": "Amazon cart preparation returned invalid output.",
+            }
+        if process.returncode not in (0, None) and parsed.get("ok") is not True:
+            parsed.setdefault("ok", False)
+            parsed.setdefault("status", "unavailable")
+            parsed.setdefault("no_purchase_made", True)
+        return parsed
+
+    async def _handle_pga_order_catalog(self, request: "web.Request") -> "web.Response":
+        """GET /v1/pga/order/catalog — profile-owned order catalog projection."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        intake, err = self._pga_order_intake_module()
+        if err is not None:
+            return err
+        try:
+            return web.json_response(intake.catalog_projection())
+        except Exception as exc:
+            return self._pga_order_intake_exception_response(exc)
+
+    async def _handle_pga_order_submission(self, request: "web.Request") -> "web.Response":
+        """POST /v1/pga/order/submissions — create and dry-run-dispatch a PGA order."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        intake, err = self._pga_order_intake_module()
+        if err is not None:
+            return err
+        body, body_err = await self._read_json_body(request)
+        if body_err is not None:
+            return body_err
+        try:
+            result = intake.submit_order_payload(
+                body,
+                actor="watch",
+                idempotency_key=request.headers.get("Idempotency-Key"),
+            )
+            if result.get("ok") is True and self._pga_order_has_amazon_cart_plan(result):
+                submission_id = result.get("submissionId")
+                if isinstance(submission_id, str) and submission_id:
+                    result["amazonCart"] = self._queue_pga_amazon_cart_prepare(intake, submission_id)
+            return web.json_response(result, status=202 if result.get("ok") is True else 400)
+        except Exception as exc:
+            return self._pga_order_intake_exception_response(exc)
+
+    async def _handle_pga_order_submission_status(self, request: "web.Request") -> "web.Response":
+        """GET /v1/pga/order/submissions/{submission_id} — sanitized PGA order status."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        intake, err = self._pga_order_intake_module()
+        if err is not None:
+            return err
+        try:
+            return web.json_response(intake.get_submission_status(request.match_info["submission_id"]))
+        except Exception as exc:
+            return self._pga_order_intake_exception_response(exc)
+
+    async def _handle_pga_order_amazon_cart(self, request: "web.Request") -> "web.Response":
+        """POST /v1/pga/order/submissions/{submission_id}/amazon-cart — gated cart preparation."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        intake, err = self._pga_order_intake_module()
+        if err is not None:
+            return err
+        body, body_err = await self._read_json_body(request)
+        if body_err is not None:
+            return body_err
+        try:
+            if body.get("confirm_cart_mutation") is not True:
+                result = intake.prepare_amazon_cart_from_submission(request.match_info["submission_id"], body)
+            else:
+                submission_id = request.match_info["submission_id"]
+                existing_status = self._pga_existing_amazon_cart_status(intake, submission_id)
+                if existing_status is not None:
+                    result = {
+                        "ok": existing_status.get("ok") is True,
+                        "status": existing_status.get("status", "amazon_cart_prepared"),
+                        "submissionId": submission_id,
+                        "vendorId": existing_status.get("vendorId"),
+                        "cartStatus": existing_status.get("cartStatus"),
+                        "cartOnlyLive": True,
+                        "statusPersisted": existing_status.get("statusPersisted") is True,
+                        "noCheckout": True,
+                        "noPurchaseMade": True,
+                        "noPaymentSet": True,
+                        "noAddressSet": True,
+                    }
+                else:
+                    task, _created = self._start_pga_amazon_cart_prepare(intake, submission_id, body)
+                    result = await task
+            return web.json_response(result, status=202 if result.get("ok") is True else 400)
+        except Exception as exc:
+            return self._pga_order_intake_exception_response(exc)
 
     async def _handle_audio_transcribe(self, request: Any) -> Any:
         """POST /api/audio/transcribe — authenticated multipart STT endpoint."""
@@ -4307,6 +4718,13 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
+            self._app.router.add_get("/v1/pga/order/catalog", self._handle_pga_order_catalog)
+            self._app.router.add_post("/v1/pga/order/submissions", self._handle_pga_order_submission)
+            self._app.router.add_get("/v1/pga/order/submissions/{submission_id}", self._handle_pga_order_submission_status)
+            self._app.router.add_post(
+                "/v1/pga/order/submissions/{submission_id}/amazon-cart",
+                self._handle_pga_order_amazon_cart,
+            )
             self._app.router.add_get("/v1/skills", self._handle_skills)
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
             self._app.router.add_post("/api/audio/transcribe", self._handle_audio_transcribe)
