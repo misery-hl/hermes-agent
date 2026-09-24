@@ -13,7 +13,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent.typed_completion import TERMINAL_TOOL_NAME, TypedCompletionContract, TypedCompletionError
+from agent.typed_completion import (
+    TERMINAL_TOOL_NAME, TYPED_COMPLETION_GUIDANCE, TypedCompletionContract,
+    TypedCompletionError, typed_prompt_cache_fingerprint,
+)
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
@@ -305,6 +308,191 @@ def test_schema_is_stable_across_native_turns_and_history_replay(make_agent):
                 agent.run_conversation("Change my rules", conversation_history=saved)
             never.assert_not_called()
     assert db.get_messages("typed-session") == before
+
+
+@pytest.mark.parametrize("typed", [False, True])
+def test_actual_api_prompt_uses_contract_presentation_and_preserves_identity_and_safety(make_agent, typed):
+    from agent.prompt_builder import PLATFORM_HINTS, TASK_COMPLETION_GUIDANCE
+
+    make, db = make_agent
+    agent = make(schema=SCHEMA if typed else None)
+    agent.platform = "api_server"
+    agent.load_soul_identity = True
+    agent._cached_system_prompt = None  # Use the real prompt builder.
+    agent.ephemeral_system_prompt = "Caller task: select the relevant saved record."
+    replies = ([response([call("lookup", '{"query":"record"}', "lookup-1")]), response([call()])]
+               if typed else [response(None, "Hello", "stop")])
+    with patch("run_agent.load_soul_md", return_value="Synthetic application identity."):
+        result, provider, lookup, _ = run(agent, replies)
+    assert result["completed"]
+    assert provider.call_count == (2 if typed else 1)
+    assert lookup.call_count == (1 if typed else 0)
+    prompts = [request.args[0]["messages"][0]["content"] for request in provider.call_args_list]
+    assert all(prompt == prompts[0] for prompt in prompts)
+    stored = db.get_session(agent.session_id)
+    assert agent.ephemeral_system_prompt not in stored["system_prompt"]
+    for sent in prompts:
+        assert "Synthetic application identity." in sent
+        assert TASK_COMPLETION_GUIDANCE in sent
+        assert "Do not modify another profile" in sent
+        assert agent.ephemeral_system_prompt in sent
+        assert sent.count(TYPED_COMPLETION_GUIDANCE) == (1 if typed else 0)
+        assert (PLATFORM_HINTS["api_server"] in sent) is not typed
+    if typed:
+        assert result["typed_response"] == VALUE
+        assert stored["system_prompt_contract"] == typed_prompt_cache_fingerprint(SCHEMA, stored["system_prompt"])
+        assert agent.valid_tool_names == {"lookup", TERMINAL_TOOL_NAME}
+    else:
+        assert stored["system_prompt_contract"] is None
+        assert agent.valid_tool_names == {"lookup"}
+
+
+def test_legacy_adoption_rebuilds_actual_prompt_once_and_restores_after_restart(make_agent, tmp_path):
+    from agent.prompt_builder import PLATFORM_HINTS
+
+    make, db = make_agent
+    sid = "legacy-prompt"
+    old_prompt = "Old identity.\n\n" + PLATFORM_HINTS["api_server"]
+    db.create_session(sid, "api_server", system_prompt=old_prompt)
+    db.append_message(sid, "user", "Earlier request")
+    db.append_message(sid, "assistant", "Earlier answer")
+    before = db.get_messages(sid)
+    history = db.get_messages_as_conversation(sid)
+    first = make(session_id=sid)
+    first.platform = "api_server"
+    first._cached_system_prompt = old_prompt
+    result, provider, _, _ = run(first, [response([call()])], history)
+    assert result["completed"]
+    saved = db.get_session(sid)
+    assert TYPED_COMPLETION_GUIDANCE in saved["system_prompt"]
+    assert PLATFORM_HINTS["api_server"] not in saved["system_prompt"]
+    assert saved["system_prompt"] != old_prompt
+    assert saved["system_prompt_contract"] == typed_prompt_cache_fingerprint(SCHEMA, saved["system_prompt"])
+    assert db.get_messages(sid)[:len(before)] == before
+    first_prefix = provider.call_args.args[0]["messages"][0]["content"]
+    history = db.get_messages_as_conversation(sid)
+    second = make(session_id=sid)
+    second.platform = "api_server"
+    second._cached_system_prompt = None
+    db.close()
+    reopened = SessionDB(tmp_path / "sessions.db")
+    try:
+        second._session_db = reopened
+        with patch.object(second, "_build_system_prompt", side_effect=AssertionError("must restore the exact prefix")):
+            result, provider, _, _ = run(second, [response([call(call_id="complete-2")])], history)
+        assert result["completed"]
+        assert provider.call_args.args[0]["messages"][0]["content"] == first_prefix
+        assert reopened.get_session(sid)["system_prompt_contract"] == saved["system_prompt_contract"]
+    finally:
+        reopened.close()
+
+
+def test_unversioned_typed_cache_and_old_writer_prompt_changes_invalidate_only_cache(tmp_path):
+    path = tmp_path / "legacy-typed-prompt.db"
+    db = SessionDB(path)
+    sid = "legacy-typed"
+    db.create_session(sid, "api_server", system_prompt="Legacy natural-text prompt")
+    db.append_message(sid, "user", "Saved request")
+    before = db.get_messages(sid)
+    db.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute("UPDATE sessions SET response_schema = ? WHERE id = ?", (json.dumps(SCHEMA, sort_keys=True, separators=(",", ":")), sid))
+        connection.execute("ALTER TABLE sessions DROP COLUMN system_prompt_contract")
+    db = SessionDB(path)
+    try:
+        assert db.get_messages(sid) == before
+        assert db.bind_response_schema(sid, SCHEMA) is True
+        assert db.get_session(sid)["system_prompt"] is None
+        assert db.get_messages(sid) == before
+        prompt = "Identity and task rules.\n\n" + TYPED_COMPLETION_GUIDANCE
+        db.update_system_prompt(sid, prompt)
+        assert db.bind_response_schema(sid, SCHEMA) is False
+        # An older writer uses the unchanged session/message columns. It does
+        # not know the new nullable provenance column or update it.
+        with sqlite3.connect(path) as connection:
+            connection.execute("UPDATE sessions SET system_prompt = ? WHERE id = ?", ("Prompt written by an older native runtime", sid))
+            assert connection.execute("SELECT id, source, response_schema FROM sessions WHERE id = ?", (sid,)).fetchone()[:2] == (sid, "api_server")
+            assert connection.execute("SELECT role, content FROM messages WHERE session_id = ?", (sid,)).fetchall() == [("user", "Saved request")]
+        assert db.bind_response_schema(sid, SCHEMA) is True
+        assert db.get_session(sid)["system_prompt"] is None
+        assert db.get_messages(sid) == before
+    finally:
+        db.close()
+
+
+def test_prompt_contract_revision_rebuilds_without_changing_schema_or_messages(make_agent):
+    make, db = make_agent
+    agent = make()
+    agent.platform = "api_server"
+    result, _, _, _ = run(agent, [response([call()])])
+    assert result["completed"]
+    saved = db.get_session(agent.session_id)
+    before = db.get_messages(agent.session_id)
+    with patch("agent.typed_completion.TYPED_COMPLETION_PROMPT_VERSION", "hermes.typed-completion-prompt.next"):
+        assert db.bind_response_schema(agent.session_id, SCHEMA) is True
+        assert db.get_session(agent.session_id)["system_prompt"] is None
+    assert db.get_session(agent.session_id)["response_schema"] == saved["response_schema"]
+    assert db.get_messages(agent.session_id) == before
+
+
+@pytest.mark.parametrize("cache_is_binary", [False, True])
+def test_restore_checks_exact_prompt_provenance_before_accepting_cached_text(make_agent, tmp_path, cache_is_binary):
+    from agent.conversation_loop import _restore_or_build_system_prompt
+    from agent.prompt_builder import PLATFORM_HINTS
+
+    make, db = make_agent
+    agent = make()
+    agent.platform = "api_server"
+    run(agent, [response([call()])])
+    before = db.get_messages(agent.session_id)
+    with sqlite3.connect(tmp_path / "sessions.db") as connection:
+        connection.execute("UPDATE sessions SET system_prompt = ? WHERE id = ?",
+                           (b"Legacy cache bytes" if cache_is_binary else PLATFORM_HINTS["api_server"], agent.session_id))
+    agent._cached_system_prompt = None
+    # Exercise restore itself, independently of the earlier schema-bind check.
+    _restore_or_build_system_prompt(agent, None, db.get_messages_as_conversation(agent.session_id))
+    assert TYPED_COMPLETION_GUIDANCE in agent._cached_system_prompt
+    assert PLATFORM_HINTS["api_server"] not in agent._cached_system_prompt
+    saved = db.get_session(agent.session_id)
+    assert saved["system_prompt_contract"] == typed_prompt_cache_fingerprint(SCHEMA, saved["system_prompt"])
+    assert db.get_messages(agent.session_id) == before
+
+
+def test_actual_compression_rebuilds_and_stamps_the_inherited_typed_contract(make_agent):
+    from agent.prompt_builder import PLATFORM_HINTS
+
+    make, db = make_agent
+    agent = make()
+    agent.platform = "api_server"
+    result, _, _, _ = run(agent, [response([call()])])
+    old_sid = agent.session_id
+    old_messages = db.get_messages(old_sid)
+    agent._compression_feasibility_checked = True
+    compressed = [{"role": "user", "content": "Retained task context."}]
+    with (patch.object(agent.context_compressor, "compress", return_value=compressed),
+          patch.object(agent, "commit_memory_session")):
+        messages, prompt = agent._compress_context(result["messages"], None, approx_tokens=1000, force=True)
+    assert messages == compressed and agent.session_id != old_sid
+    child = db.get_session(agent.session_id)
+    assert child["parent_session_id"] == old_sid
+    assert json.loads(child["response_schema"]) == SCHEMA
+    assert child["system_prompt"] == prompt
+    assert TYPED_COMPLETION_GUIDANCE in prompt and PLATFORM_HINTS["api_server"] not in prompt
+    assert child["system_prompt_contract"] == typed_prompt_cache_fingerprint(SCHEMA, prompt)
+    assert db.bind_response_schema(agent.session_id, SCHEMA) is False
+    assert db.get_messages(old_sid) == old_messages
+
+
+def test_freeform_adoption_preserves_the_exact_cached_prompt(make_agent):
+    _, db = make_agent
+    sid = "legacy-freeform"
+    db.create_session(sid, "api_server", system_prompt="Exact original freeform prompt")
+    db.append_message(sid, "user", "Prior message")
+    before = db.get_messages(sid)
+    assert db.bind_response_schema(sid, None) is False
+    assert db.get_session(sid)["system_prompt"] == "Exact original freeform prompt"
+    assert db.get_session(sid)["system_prompt_contract"] is None
+    assert db.get_messages(sid) == before
 
 
 def test_legacy_contract_adoption_preserves_every_message_and_compression_inherits(make_agent):

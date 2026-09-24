@@ -290,8 +290,17 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 elif raw_prompt == "":
                     stored_state = "empty"
                 else:
-                    stored_prompt = raw_prompt
                     stored_state = "present"
+                    contract = getattr(agent, "_typed_completion_contract", None)
+                    if contract is not None:
+                        from agent.typed_completion import typed_prompt_cache_fingerprint
+                        if (not isinstance(raw_prompt, str)
+                                or session_row.get("system_prompt_contract") != typed_prompt_cache_fingerprint(contract.schema, raw_prompt)):
+                            stored_state = "contract_mismatch"
+                        else:
+                            stored_prompt = raw_prompt
+                    else:
+                        stored_prompt = raw_prompt
         except Exception as exc:
             logger.warning(
                 "Session DB get_session failed for system-prompt restore "
@@ -306,7 +315,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         agent._cached_system_prompt = stored_prompt
         return
 
-    if conversation_history and stored_state in ("null", "empty"):
+    if conversation_history and stored_state in ("null", "empty", "contract_mismatch"):
         # Continuing session whose stored prompt is unusable.  The
         # previous turn's write either never happened or wrote an empty
         # string — either way every turn now rebuilds and the prefix
@@ -472,9 +481,11 @@ def run_conversation(
         existing = agent._session_db.get_session(agent.session_id)
         if typed_contract is not None or (isinstance(existing, dict) and existing.get("response_schema") is not None):
             agent._ensure_db_session()
-            agent._session_db.bind_response_schema(
+            prompt_invalidated = agent._session_db.bind_response_schema(
                 agent.session_id, typed_contract.schema if typed_contract is not None else None
             )
+            if prompt_invalidated:
+                agent._cached_system_prompt = None
     if typed_contract is not None and (stream_callback or agent.stream_delta_callback):
         raise ValueError("typed_completion_streaming_unsupported")
 
