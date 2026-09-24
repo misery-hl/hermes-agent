@@ -222,6 +222,7 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
+    response_schema: Optional[Dict[str, Any]] = None,
 ):
     """
     Initialize the AI Agent.
@@ -284,6 +285,10 @@ def init_agent(
     agent.quiet_mode = quiet_mode
     agent.tool_progress_mode = tool_progress_mode
     agent.ephemeral_system_prompt = ephemeral_system_prompt
+    from agent.typed_completion import TypedCompletionContract
+    agent._typed_completion_contract = (
+        TypedCompletionContract(response_schema) if response_schema is not None else None
+    )
     agent.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
     agent._user_id = user_id  # Platform user identifier (gateway sessions)
     agent._user_id_alt = user_id_alt  # Optional stable alternate platform identifier
@@ -1566,6 +1571,17 @@ def init_agent(
                 agent.valid_tool_names.add(_tname)
                 agent._context_engine_tool_names.add(_tname)
                 _existing_tool_names.add(_tname)
+
+    # A caller-owned terminal definition is stable for the whole agent/session.
+    # It is deliberately not registered as an executable/effectful tool.
+    if agent._typed_completion_contract is not None:
+        from agent.typed_completion import SUPPORTED_TRANSPORTS, TERMINAL_TOOL_NAME, TypedCompletionError
+        if agent.api_mode not in SUPPORTED_TRANSPORTS:
+            raise TypedCompletionError("typed_completion_transport_unsupported")
+        if TERMINAL_TOOL_NAME in agent.valid_tool_names:
+            raise TypedCompletionError("typed_completion_tool_collision")
+        agent.tools = [*(agent.tools or []), agent._typed_completion_contract.tool_definition()]
+        agent.valid_tool_names.add(TERMINAL_TOOL_NAME)
 
     # Notify context engine of session start
     if hasattr(agent, "context_compressor") and agent.context_compressor:

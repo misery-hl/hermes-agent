@@ -58,6 +58,7 @@ class BedrockTransport(ProviderTransport):
             max_tokens=params.get("max_tokens", 4096),
             temperature=params.get("temperature"),
             guardrail_config=guardrail,
+            tool_choice=params.get("tool_choice"),
         )
         # Sentinel keys for dispatch — agent pops these before the boto3 call
         kwargs["__bedrock_converse__"] = True
@@ -79,7 +80,7 @@ class BedrockTransport(ProviderTransport):
             ns = response
         else:
             # Raw boto3 dict
-            ns = normalize_converse_response(response)
+            ns = normalize_converse_response(response, strict_tools=kwargs.get("strict_tools", False))
 
         choice = ns.choices[0]
         msg = choice.message

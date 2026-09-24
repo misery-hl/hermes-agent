@@ -106,6 +106,15 @@ class AnthropicTransport(ProviderTransport):
         # tests/agent/test_anthropic_thinking_block_order.py.
         ordered_blocks = []
 
+        if kwargs.get("strict_tools"):
+            from agent.typed_completion import TypedCompletionError
+            if getattr(response, "role", None) != "assistant":
+                raise TypedCompletionError("typed_completion_invalid_envelope")
+            for block in response.content:
+                if (getattr(block, "type", None) not in {"text", "thinking", "redacted_thinking", "tool_use"}
+                        or (block.type == "tool_use" and not isinstance(getattr(block, "input", None), dict))):
+                    raise TypedCompletionError("typed_completion_invalid_envelope")
+
         for block in response.content:
             block_dict = _to_plain_data(block)
             clean_block = None
@@ -140,7 +149,9 @@ class AnthropicTransport(ProviderTransport):
                     # in the tool registry under their FULL mcp_<server>_<tool>
                     # name and must NOT be stripped.  GH-25255.
                     from tools.registry import registry as _tool_registry
-                    if (_tool_registry.get_entry(stripped)
+                    from agent.typed_completion import TERMINAL_TOOL_NAME
+                    if ((_tool_registry.get_entry(stripped)
+                         or (kwargs.get("strict_tools") and stripped == TERMINAL_TOOL_NAME))
                             and not _tool_registry.get_entry(name)):
                         name = stripped
                 tool_calls.append(

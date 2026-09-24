@@ -461,6 +461,23 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
+    typed_contract = getattr(agent, "_typed_completion_contract", None)
+    if typed_contract is not None:
+        from agent.typed_completion import SUPPORTED_TRANSPORTS, TypedCompletionError
+        if agent.api_mode not in SUPPORTED_TRANSPORTS:
+            raise TypedCompletionError("typed_completion_transport_unsupported")
+    agent._typed_response = None
+    agent._typed_completion_error = None
+    if agent._session_db is not None:
+        existing = agent._session_db.get_session(agent.session_id)
+        if typed_contract is not None or (isinstance(existing, dict) and existing.get("response_schema") is not None):
+            agent._ensure_db_session()
+            agent._session_db.bind_response_schema(
+                agent.session_id, typed_contract.schema if typed_contract is not None else None
+            )
+    if typed_contract is not None and (stream_callback or agent.stream_delta_callback):
+        raise ValueError("typed_completion_streaming_unsupported")
+
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
     # message sanitization, todo/nudge hydration, system-prompt restore-or-
@@ -523,7 +540,7 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
-    while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+    while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or (agent._budget_grace_call and typed_contract is None):
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
         agent._checkpoint_mgr.new_turn()
 
@@ -1195,6 +1212,12 @@ def run_conversation(
                             error_details.append("response.choices is empty")
 
                 if response_invalid:
+                    if typed_contract is not None:
+                        # A malformed completion is a terminal protocol error,
+                        # not permission to repair output or change provider.
+                        agent._typed_completion_error = "typed_completion_invalid_response"
+                        _stop_spinner()
+                        break
                     agent._invoke_api_request_error_hook(
                         task_id=effective_task_id,
                         turn_id=turn_id,
@@ -1398,7 +1421,7 @@ def run_conversation(
                 # refusal. Surface it clearly and stop. Mirrors the
                 # exception-based ``content_policy_blocked`` recovery: try a
                 # configured fallback once, otherwise return the refusal.
-                if finish_reason == "content_filter":
+                if finish_reason == "content_filter" and typed_contract is None:
                     _refusal_transport = agent._get_transport()
                     if agent.api_mode == "anthropic_messages":
                         _refusal_result = _refusal_transport.normalize_response(
@@ -1484,7 +1507,7 @@ def run_conversation(
                         error_detail=_refusal_text or "model declined (content_filter)",
                     )
 
-                if finish_reason == "length":
+                if finish_reason == "length" and typed_contract is None:
                     if getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID:
                         agent._vprint(
                             f"{agent.log_prefix}⚠️  Stream interrupted by network error "
@@ -1906,6 +1929,12 @@ def run_conversation(
                 break
 
             except Exception as api_error:
+                if typed_contract is not None:
+                    from agent.typed_completion import TypedCompletionError
+                    if isinstance(api_error, TypedCompletionError):
+                        agent._typed_completion_error = str(api_error)
+                        _stop_spinner()
+                        break
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
                 if thinking_spinner:
@@ -3438,6 +3467,12 @@ def run_conversation(
                             f"{int(sleep_end - time.time())}s remaining"
                         )
         
+        if typed_contract is not None and agent._typed_completion_error:
+            _turn_exit_reason = "typed_completion_invalid"
+            final_response = ""
+            failed = True
+            break
+
         # If the API call was interrupted, skip response processing
         if interrupted:
             _turn_exit_reason = "interrupted_during_api_call"
@@ -3480,12 +3515,36 @@ def run_conversation(
 
         try:
             _transport = agent._get_transport()
-            _normalize_kwargs = {}
+            _normalize_kwargs = {"strict_tools": typed_contract is not None}
             if agent.api_mode == "anthropic_messages":
                 _normalize_kwargs["strip_tool_prefix"] = agent._is_anthropic_oauth
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
             assistant_message = normalized
             finish_reason = normalized.finish_reason
+
+            if typed_contract is not None:
+                from agent.typed_completion import TERMINAL_TOOL_NAME, TypedCompletionError
+                try:
+                    typed_value = typed_contract.inspect_response(assistant_message, agent.valid_tool_names)
+                except TypedCompletionError as exc:
+                    agent._typed_completion_error = str(exc)
+                    _turn_exit_reason = "typed_completion_invalid"
+                    final_response = ""
+                    failed = True
+                    break
+                if typed_value is not None:
+                    # Keep a complete native call/result pair for the next
+                    # turn. Never dispatch this terminal operation as a tool.
+                    messages.append(agent._build_assistant_message(assistant_message, finish_reason))
+                    messages.append({
+                        "role": "tool", "name": TERMINAL_TOOL_NAME,
+                        "tool_call_id": assistant_message.tool_calls[0].id,
+                        "content": '{"status":"completed"}',
+                    })
+                    agent._typed_response = typed_value
+                    final_response = ""
+                    _turn_exit_reason = "typed_completion"
+                    break
             
             # Normalize content to string — some OpenAI-compatible servers
             # (llama-server, etc.) return content as a dict or list instead
@@ -4353,6 +4412,13 @@ def run_conversation(
             # recover the call site.  logger.exception() includes the
             # traceback automatically and emits at ERROR.
             logger.exception("Outer loop error in API call #%d", api_call_count)
+
+            if typed_contract is not None:
+                agent._typed_completion_error = "typed_completion_processing_failed"
+                _turn_exit_reason = "typed_completion_invalid"
+                final_response = ""
+                failed = True
+                break
             
             # If an assistant message with tool_calls was already appended,
             # the API expects a role="tool" result for every tool_call_id.

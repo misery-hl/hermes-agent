@@ -661,7 +661,7 @@ def _converse_stop_reason_to_openai(stop_reason: str) -> str:
     return mapping.get(stop_reason, "stop")
 
 
-def normalize_converse_response(response: Dict) -> SimpleNamespace:
+def normalize_converse_response(response: Dict, *, strict_tools: bool = False) -> SimpleNamespace:
     """Convert a Bedrock Converse API response to an OpenAI-compatible object.
 
     The agent loop in ``run_agent.py`` expects responses shaped like
@@ -673,6 +673,31 @@ def normalize_converse_response(response: Dict) -> SimpleNamespace:
       - ``.choices[0].finish_reason`` — stop/tool_calls/length
       - ``.usage`` — token usage stats
     """
+    if strict_tools:
+        from agent.typed_completion import TypedCompletionError
+        try:
+            message = response["output"]["message"]
+            blocks = message["content"]
+            valid = message["role"] == "assistant" and isinstance(blocks, list) and bool(blocks)
+            valid = valid and response["stopReason"] in {
+                "end_turn", "stop_sequence", "tool_use", "max_tokens", "content_filtered", "guardrail_intervened"
+            }
+            for block in blocks:
+                if not isinstance(block, dict) or len(block) != 1:
+                    valid = False
+                elif "toolUse" in block:
+                    tool = block["toolUse"]
+                    valid = valid and isinstance(tool, dict) and set(tool) == {"toolUseId", "name", "input"}
+                    if valid:
+                        valid = all(isinstance(tool[key], str) and tool[key] for key in ("toolUseId", "name")) and isinstance(tool["input"], dict)
+                elif "text" in block:
+                    valid = valid and isinstance(block["text"], str)
+                elif "reasoningContent" not in block:
+                    valid = False
+            if not valid:
+                raise ValueError
+        except (KeyError, TypeError, ValueError) as exc:
+            raise TypedCompletionError("typed_completion_invalid_envelope") from exc
     output = response.get("output", {})
     message = output.get("message", {})
     content_blocks = message.get("content", [])
@@ -763,6 +788,7 @@ def stream_converse_with_callbacks(
     on_tool_start=None,
     on_reasoning_delta=None,
     on_interrupt_check=None,
+    strict_tools: bool = False,
 ) -> SimpleNamespace:
     """Process a Bedrock ConverseStream event stream with real-time callbacks.
 
@@ -795,15 +821,39 @@ def stream_converse_with_callbacks(
     has_tool_use = False
     stop_reason = "end_turn"
     usage_data: Dict[str, int] = {}
+    saw_message_stop = False
+    strict_invalid = False
 
     for event in event_stream.get("stream", []):
         # Check for interrupt
         if on_interrupt_check and on_interrupt_check():
             break
 
+        if strict_tools:
+            from agent.typed_completion import TypedCompletionError
+            if not isinstance(event, dict) or len(event) != 1 or not all(isinstance(value, dict) for value in event.values()):
+                raise TypedCompletionError("typed_completion_invalid_envelope")
+            if saw_message_stop and "metadata" not in event:
+                strict_invalid = True
+            for name, field in (("contentBlockStart", "start"), ("contentBlockDelta", "delta")):
+                if name in event:
+                    part = event[name].get(field)
+                    if not isinstance(part, dict) or len(part) > 1:
+                        raise TypedCompletionError("typed_completion_invalid_envelope")
+                    if "toolUse" in part and not isinstance(part["toolUse"], dict):
+                        raise TypedCompletionError("typed_completion_invalid_envelope")
+                    if name == "contentBlockDelta" and (
+                        ("text" in part and not isinstance(part["text"], str))
+                        or ("toolUse" in part and not isinstance(part["toolUse"].get("input"), str))
+                    ):
+                        raise TypedCompletionError("typed_completion_invalid_envelope")
+
         if "contentBlockStart" in event:
             start = event["contentBlockStart"].get("start", {})
             if "toolUse" in start:
+                if strict_tools and (current_tool is not None or set(start) != {"toolUse"}
+                                     or set(start["toolUse"]) != {"toolUseId", "name"}):
+                    strict_invalid = True
                 has_tool_use = True
                 # Flush any accumulated text
                 if current_text_buffer:
@@ -813,12 +863,16 @@ def stream_converse_with_callbacks(
                     "toolUseId": start["toolUse"].get("toolUseId", ""),
                     "name": start["toolUse"].get("name", ""),
                     "input_json": "",
+                    "index": event["contentBlockStart"].get("contentBlockIndex"),
                 }
                 if on_tool_start:
                     on_tool_start(current_tool["name"])
 
         elif "contentBlockDelta" in event:
             delta = event["contentBlockDelta"].get("delta", {})
+            if strict_tools and (len(delta) != 1 or not set(delta) <= {"text", "toolUse", "reasoningContent"}
+                                 or (current_tool is not None and event["contentBlockDelta"].get("contentBlockIndex") != current_tool["index"])):
+                strict_invalid = True
             if "text" in delta:
                 text = delta["text"]
                 current_text_buffer.append(text)
@@ -827,6 +881,8 @@ def stream_converse_with_callbacks(
                 if on_text_delta and not has_tool_use:
                     on_text_delta(text)
             elif "toolUse" in delta:
+                if strict_tools and (current_tool is None or set(delta["toolUse"]) != {"input"}):
+                    strict_invalid = True
                 if current_tool is not None:
                     current_tool["input_json"] += delta["toolUse"].get("input", "")
             elif "reasoningContent" in delta:
@@ -841,16 +897,25 @@ def stream_converse_with_callbacks(
 
         elif "contentBlockStop" in event:
             if current_tool is not None:
-                try:
-                    input_dict = json.loads(current_tool["input_json"]) if current_tool["input_json"] else {}
-                except (json.JSONDecodeError, TypeError):
-                    input_dict = {}
+                if strict_tools:
+                    # Keep exact argument bytes for the terminal validator.
+                    # The legacy collector repairs malformed JSON to {}; that
+                    # must never turn invalid typed output into a valid object.
+                    arguments = current_tool["input_json"]
+                    if event["contentBlockStop"].get("contentBlockIndex") != current_tool["index"]:
+                        strict_invalid = True
+                else:
+                    try:
+                        input_dict = json.loads(current_tool["input_json"]) if current_tool["input_json"] else {}
+                    except (json.JSONDecodeError, TypeError):
+                        input_dict = {}
+                    arguments = json.dumps(input_dict)
                 tool_calls.append(SimpleNamespace(
                     id=current_tool["toolUseId"],
                     type="function",
                     function=SimpleNamespace(
                         name=current_tool["name"],
-                        arguments=json.dumps(input_dict),
+                        arguments=arguments,
                     ),
                 ))
                 current_tool = None
@@ -860,6 +925,10 @@ def stream_converse_with_callbacks(
 
         elif "messageStop" in event:
             stop_reason = event["messageStop"].get("stopReason", "end_turn")
+            saw_message_stop = True
+            if strict_tools and (current_tool is not None or "stopReason" not in event["messageStop"]
+                                 or stop_reason not in {"end_turn", "stop_sequence", "tool_use", "max_tokens", "content_filtered", "guardrail_intervened"}):
+                strict_invalid = True
 
         elif "metadata" in event:
             meta_usage = event["metadata"].get("usage", {})
@@ -867,6 +936,12 @@ def stream_converse_with_callbacks(
                 "inputTokens": meta_usage.get("inputTokens", 0),
                 "outputTokens": meta_usage.get("outputTokens", 0),
             }
+        elif strict_tools and ("messageStart" not in event or event["messageStart"].get("role") != "assistant"):
+            strict_invalid = True
+
+    if strict_tools and (strict_invalid or not saw_message_stop or current_tool is not None):
+        from agent.typed_completion import TypedCompletionError
+        raise TypedCompletionError("typed_completion_invalid_envelope")
 
     # Flush remaining text
     if current_text_buffer:
@@ -917,6 +992,7 @@ def build_converse_kwargs(
     top_p: Optional[float] = None,
     stop_sequences: Optional[List[str]] = None,
     guardrail_config: Optional[Dict] = None,
+    tool_choice: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Build kwargs for ``bedrock-runtime.converse()`` or ``converse_stream()``.
 
@@ -947,7 +1023,7 @@ def build_converse_kwargs(
     if stop_sequences:
         kwargs["inferenceConfig"]["stopSequences"] = stop_sequences
 
-    if tools:
+    if tools and tool_choice != "none":
         converse_tools = convert_tools_to_converse(tools)
         if converse_tools:
             # Some Bedrock models don't support tool/function calling (e.g.
@@ -962,6 +1038,25 @@ def build_converse_kwargs(
                     "Model %s does not support tool calling — tools stripped. "
                     "The agent will operate in text-only mode.", model
                 )
+
+    if tool_choice is not None and tool_choice != "none":
+        if not kwargs.get("toolConfig"):
+            raise ValueError("tool_choice requires a model and tools that support tool calling")
+        if tool_choice in ("required", "any"):
+            choice = {"any": {}}
+        elif tool_choice == "auto":
+            choice = {"auto": {}}
+        elif (isinstance(tool_choice, dict) and set(tool_choice) == {"type", "function"}
+              and tool_choice["type"] == "function" and isinstance(tool_choice["function"], dict)
+              and set(tool_choice["function"]) == {"name"}):
+            name = tool_choice["function"]["name"]
+            names = {tool["toolSpec"]["name"] for tool in kwargs["toolConfig"]["tools"]}
+            if not isinstance(name, str) or name not in names:
+                raise ValueError("tool_choice names an unavailable tool")
+            choice = {"tool": {"name": name}}
+        else:
+            raise ValueError("unsupported tool_choice")
+        kwargs["toolConfig"]["toolChoice"] = choice
 
     if guardrail_config:
         kwargs["guardrailConfig"] = guardrail_config

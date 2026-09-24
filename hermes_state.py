@@ -517,6 +517,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     user_id TEXT,
     model TEXT,
     model_config TEXT,
+    response_schema TEXT,
     system_prompt TEXT,
     parent_session_id TEXT,
     started_at REAL NOT NULL,
@@ -1285,10 +1286,16 @@ class SessionDB:
     ) -> None:
         """Shared INSERT OR IGNORE for session rows."""
         def _do(conn):
+            # Compression/fork children retain the same caller-owned tool
+            # contract. SQL NULL is unbound; JSON "null" is bound freeform.
+            parent_contract = conn.execute(
+                "SELECT response_schema FROM sessions WHERE id = ? AND end_reason IN ('compression', 'branched')",
+                (parent_session_id,),
+            ).fetchone() if parent_session_id else None
             conn.execute(
                 """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
-                   system_prompt, parent_session_id, cwd, started_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   system_prompt, parent_session_id, cwd, started_at, response_schema)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     source,
@@ -1299,8 +1306,33 @@ class SessionDB:
                     parent_session_id,
                     cwd,
                     time.time(),
+                    parent_contract[0] if parent_contract else None,
                 ),
             )
+        self._execute_write(_do)
+
+    def bind_response_schema(self, session_id: str, schema: Optional[Dict[str, Any]]) -> None:
+        """Atomically adopt a caller-owned response contract exactly once.
+
+        Legacy sessions may adopt a contract without rewriting their history.
+        This is one explicit cache-definition boundary, selected by the trusted
+        caller. A bound contract cannot change or be dropped. It is independent
+        of mutable model_config and survives compression.
+        """
+        encoded = json.dumps(schema, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT response_schema FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("response_schema_session_missing")
+            saved = row[0]
+            if saved is None:
+                conn.execute("UPDATE sessions SET response_schema = ? WHERE id = ?", (encoded, session_id))
+            elif saved != encoded:
+                raise ValueError("response_schema_changed")
+
         self._execute_write(_do)
 
     def create_session(self, session_id: str, source: str, **kwargs) -> str:

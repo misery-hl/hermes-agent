@@ -24,6 +24,31 @@ class TestBedrockBasic:
 
 class TestBedrockBuildKwargs:
 
+    @pytest.mark.parametrize("selection, expected", [
+        ("required", {"any": {}}), ("any", {"any": {}}), ("auto", {"auto": {}}),
+        ({"type": "function", "function": {"name": "complete"}}, {"tool": {"name": "complete"}}),
+    ])
+    def test_tool_choice_is_forwarded_for_nova(self, transport, selection, expected):
+        tool = {"type": "function", "function": {"name": "complete", "description": "Finish", "parameters": {"type": "object"}}}
+        kwargs = transport.build_kwargs(model="us.amazon.nova-lite-v1:0", messages=[{"role": "user", "content": "Hello"}],
+                                        tools=[tool], tool_choice=selection)
+        assert kwargs["toolConfig"]["toolChoice"] == expected
+
+    @pytest.mark.parametrize("selection", ["bogus", {}, {"type": "function", "function": {"name": "missing"}}])
+    def test_invalid_tool_choice_is_rejected(self, transport, selection):
+        tool = {"type": "function", "function": {"name": "complete", "parameters": {"type": "object"}}}
+        with pytest.raises(ValueError):
+            transport.build_kwargs(model="us.amazon.nova-lite-v1:0", messages=[], tools=[tool], tool_choice=selection)
+
+    def test_required_choice_cannot_silently_strip_tools(self, transport):
+        with pytest.raises(ValueError):
+            transport.build_kwargs(model="us.amazon.nova-lite-v1:0", messages=[], tool_choice="required")
+
+    def test_none_choice_excludes_tools(self, transport):
+        tool = {"type": "function", "function": {"name": "complete", "parameters": {"type": "object"}}}
+        kwargs = transport.build_kwargs(model="us.amazon.nova-lite-v1:0", messages=[], tools=[tool], tool_choice="none")
+        assert "toolConfig" not in kwargs
+
     def test_basic_kwargs(self, transport):
         msgs = [{"role": "user", "content": "Hello"}]
         kw = transport.build_kwargs(model="anthropic.claude-3-5-sonnet-20241022-v2:0", messages=msgs)

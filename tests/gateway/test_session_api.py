@@ -1,6 +1,6 @@
 """Focused tests for API server session-control endpoints."""
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
@@ -9,6 +9,107 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from hermes_state import SessionDB
+
+
+TYPED_SCHEMA = {"type": "object", "properties": {"kind": {"enum": ["ok"]}}, "required": ["kind"], "additionalProperties": False}
+
+
+@pytest.mark.asyncio
+async def test_response_contract_threads_through_existing_agent_runner(adapter):
+    agent = MagicMock()
+    agent.session_id = "typed-thread"
+    agent.session_prompt_tokens = 10
+    agent.session_completion_tokens = 5
+    agent.session_total_tokens = 15
+    agent.run_conversation.return_value = {"final_response": "", "typed_response": {"kind": "ok"}}
+    with patch.object(adapter, "_create_agent", return_value=agent) as create:
+        result, usage = await adapter._run_agent("hello", [], session_id=agent.session_id, response_schema=TYPED_SCHEMA)
+    assert create.call_args.kwargs["response_schema"] == TYPED_SCHEMA
+    agent.run_conversation.assert_called_once_with(user_message="hello", conversation_history=[], task_id=agent.session_id)
+    assert result["typed_response"] == {"kind": "ok"} and usage["total_tokens"] == 15
+
+
+@pytest.mark.asyncio
+async def test_typed_session_chat_preserves_auth_contract_usage_and_session_id(auth_adapter, session_db):
+    session_id = session_db.create_session("typed", "api_server")
+    run = AsyncMock(return_value=({"final_response": "untrusted text", "typed_response": {"kind": "ok"}, "session_id": session_id}, {"total_tokens": 4}))
+    app = _create_session_app(auth_adapter)
+    with patch.object(auth_adapter, "_run_agent", run):
+        async with TestClient(TestServer(app)) as client:
+            denied = await client.post(f"/api/sessions/{session_id}/chat", json={"message": "hello", "response_schema": TYPED_SCHEMA})
+            assert denied.status == 401
+            assert session_db.get_session(session_id)["response_schema"] is None
+            reply = await client.post(f"/api/sessions/{session_id}/chat", json={"message": "hello", "response_schema": TYPED_SCHEMA},
+                                      headers={"Authorization": "Bearer sk-test", "X-Hermes-Session-Key": "trusted-client"})
+            assert reply.status == 200
+            result = await reply.json()
+    assert result["typed_response"] == {"kind": "ok"}
+    assert result["message"] == {"role": "assistant", "content": ""}
+    assert result["usage"] == {"total_tokens": 4}
+    assert reply.headers["X-Hermes-Session-Id"] == session_id
+    assert reply.headers["X-Hermes-Session-Key"] == "trusted-client"
+    assert run.call_args.kwargs["response_schema"] == TYPED_SCHEMA
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native_result", [
+    {"final_response": '{"kind":"ok"}'},
+    {"final_response": "bad prose", "typed_completion_error": "typed_completion_missing", "failed": True},
+    {"typed_response": {"kind": "invented"}},
+    {"typed_response": {"kind": "ok"}, "interrupted": True},
+])
+async def test_typed_session_chat_never_converts_prose_or_returns_invalid_data(auth_adapter, session_db, native_result):
+    session_id = session_db.create_session("typed-invalid", "api_server")
+    run = AsyncMock(return_value=(native_result, {"total_tokens": 7}))
+    app = _create_session_app(auth_adapter)
+    with patch.object(auth_adapter, "_run_agent", run):
+        async with TestClient(TestServer(app)) as client:
+            reply = await client.post(f"/api/sessions/{session_id}/chat", json={"message": "hello", "response_schema": TYPED_SCHEMA},
+                                      headers={"Authorization": "Bearer sk-test"})
+            result = await reply.json()
+    assert reply.status == 502 and result["error"]["code"] == "typed_completion_invalid"
+    assert "typed_response" not in result and "message" not in result
+    assert result["usage"] == {"total_tokens": 7}
+    assert run.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_adoption_is_once_only_and_preserves_transcript(auth_adapter, session_db):
+    session_id = session_db.create_session("legacy-typed", "api_server")
+    session_db.append_message(session_id, "user", "old request")
+    session_db.append_message(session_id, "assistant", "old freeform answer")
+    original = session_db.get_messages(session_id)
+    run = AsyncMock(return_value=({"typed_response": {"kind": "ok"}}, {}))
+    app = _create_session_app(auth_adapter)
+    with patch.object(auth_adapter, "_run_agent", run):
+        async with TestClient(TestServer(app)) as client:
+            route = f"/api/sessions/{session_id}/chat"
+            headers = {"Authorization": "Bearer sk-test"}
+            adopted = await client.post(route, json={"message": "next", "response_schema": TYPED_SCHEMA}, headers=headers)
+            assert adopted.status == 200
+            omitted = await client.post(route, json={"message": "next"}, headers=headers)
+            assert omitted.status == 409
+            changed = await client.post(route, json={"message": "next", "response_schema": {"type": "object"}}, headers=headers)
+            assert changed.status == 409
+            streamed = await client.post(route + "/stream", json={"message": "next"}, headers=headers)
+            assert streamed.status == 409
+    assert run.await_count == 1 and session_db.get_messages(session_id) == original
+
+
+@pytest.mark.asyncio
+async def test_invalid_schema_and_typed_stream_fail_before_agent(auth_adapter, session_db):
+    session_id = session_db.create_session("invalid-contract", "api_server")
+    app = _create_session_app(auth_adapter)
+    with patch.object(auth_adapter, "_run_agent", AsyncMock()) as run:
+        async with TestClient(TestServer(app)) as client:
+            route = f"/api/sessions/{session_id}/chat"
+            headers = {"Authorization": "Bearer sk-test"}
+            bad = await client.post(route, json={"message": "hello", "response_schema": {"$ref": "https://example.invalid"}}, headers=headers)
+            assert bad.status == 400
+            stream = await client.post(route + "/stream", json={"message": "hello", "response_schema": TYPED_SCHEMA}, headers=headers)
+            assert stream.status == 400
+    run.assert_not_called()
+    assert session_db.get_session(session_id)["response_schema"] is None
 
 
 @pytest.fixture

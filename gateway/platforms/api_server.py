@@ -1049,6 +1049,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
+        response_schema: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1100,6 +1101,7 @@ class APIServerAdapter(BasePlatformAdapter):
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
+            **({"response_schema": response_schema} if response_schema is not None else {}),
         )
         return agent
 
@@ -2109,6 +2111,16 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
+        from agent.typed_completion import TypedCompletionContract, TypedCompletionError
+        contract = None
+        try:
+            if "response_schema" in body:
+                contract = TypedCompletionContract(body["response_schema"])
+            self._ensure_session_db().bind_response_schema(session_id, contract.schema if contract else None)
+        except TypedCompletionError as exc:
+            return web.json_response(_openai_error(str(exc), code="invalid_response_schema"), status=400)
+        except ValueError:
+            return web.json_response(_openai_error("The response schema is fixed for this session", code="response_schema_changed"), status=409)
         history = self._conversation_history_for_session(session_id)
         result, usage = await self._run_agent(
             user_message=user_message,
@@ -2116,18 +2128,32 @@ class APIServerAdapter(BasePlatformAdapter):
             ephemeral_system_prompt=system_prompt,
             session_id=session_id,
             gateway_session_key=gateway_session_key,
+            **({"response_schema": contract.schema} if contract else {}),
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = result.get("final_response", "") if isinstance(result, dict) else ""
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key
+        typed_fields = {}
+        if contract is not None:
+            try:
+                if not isinstance(result, dict) or result.get("failed") or result.get("interrupted") or "typed_response" not in result:
+                    raise TypedCompletionError("typed_completion_invalid")
+                typed_fields["typed_response"] = contract.validate_value(result["typed_response"])
+                final_response = ""
+            except TypedCompletionError:
+                return web.json_response(
+                    {**_openai_error("The model did not return a valid typed completion", code="typed_completion_invalid"), "usage": usage},
+                    status=502, headers=headers,
+                )
         return web.json_response(
             {
                 "object": "hermes.session.chat.completion",
                 "session_id": effective_session_id or session_id,
                 "message": {"role": "assistant", "content": final_response},
                 "usage": usage,
+                **typed_fields,
             },
             headers=headers,
         )
@@ -2153,6 +2179,12 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
+        if "response_schema" in body:
+            return web.json_response(_openai_error("Typed completion uses synchronous session chat", code="typed_completion_streaming_unsupported"), status=400)
+        try:
+            self._ensure_session_db().bind_response_schema(session_id, None)
+        except ValueError:
+            return web.json_response(_openai_error("The response schema is fixed for this session", code="response_schema_changed"), status=409)
 
         loop = asyncio.get_running_loop()
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
@@ -4048,6 +4080,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        response_schema: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4080,6 +4113,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_start_callback=tool_start_callback,
                     tool_complete_callback=tool_complete_callback,
                     gateway_session_key=gateway_session_key,
+                    **({"response_schema": response_schema} if response_schema is not None else {}),
                 )
                 if agent_ref is not None:
                     agent_ref[0] = agent
