@@ -342,6 +342,122 @@ curl -N -X POST http://localhost:8642/api/sessions/$ID/chat/stream \
   -d '{"input": "what files changed in the last hour?"}'
 ```
 
+### Typed completion on synchronous session chat
+
+A trusted API caller can add `response_schema` to
+`POST /api/sessions/{id}/chat` to require a JSON object as the final result.
+Send the JSON Schema object directly in this field. This contract is supported
+on synchronous session chat; it is not a streaming response format or an
+additional contract for `/v1/chat/completions`, `/v1/responses`, or `/v1/runs`.
+The session must already exist, and the usual bearer authentication applies.
+
+Include `--extra typed-completion` in your normal `uv sync` command for a source
+installation. The supplied Docker build includes this extra. Hermes requires
+its `jsonschema` validator when `response_schema` is present. Supported native
+transports are `chat_completions`, `anthropic_messages`, and
+`bedrock_converse`; the selected provider and model must also support the
+schema and required tool calling.
+
+For example, send this JSON body to `/api/sessions/{id}/chat`:
+
+```json
+{
+  "input": "I need a sales report.",
+  "system_message": "Classify the request. Ask for a date range when it is missing.",
+  "response_schema": {
+    "type": "object",
+    "properties": {
+      "action": {"type": "string", "enum": ["prepare_report", "clarify"]},
+      "missing_field": {"type": "string", "enum": ["none", "date_range"]}
+    },
+    "required": ["action", "missing_field"],
+    "additionalProperties": false
+  }
+}
+```
+
+A successful response has HTTP status `200` and this shape:
+
+```json
+{
+  "object": "hermes.session.chat.completion",
+  "session_id": "api_example",
+  "message": {"role": "assistant", "content": ""},
+  "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120},
+  "typed_response": {"action": "clarify", "missing_field": "date_range"}
+}
+```
+
+Read the validated object from top-level `typed_response`. `message.content`
+is empty for a typed success. `session_id` and `X-Hermes-Session-Id` identify
+the effective session, including a continuation created by context compression.
+The existing `usage` fields and optional `X-Hermes-Session-Key` response header
+remain available.
+
+#### Schema and terminal behavior
+
+- Use a self-contained JSON Schema 2020-12 object with root `"type": "object"`.
+  If `$schema` is present, its value must be
+  `https://json-schema.org/draft/2020-12/schema`.
+- `$ref`, `$dynamicRef`, `$recursiveRef`, and `$id` are rejected at every level.
+  Local references are also rejected. Inline the definitions that the result
+  needs. Self-contained `oneOf` branches are supported by Hermes validation.
+- Schemas and result values are bounded to 65,536 bytes after canonical JSON
+  encoding, 4,096 JSON nodes, and nesting depth 32. Non-finite numbers are
+  rejected. Terminal tool arguments also have a 65,536-byte limit and reject
+  duplicate object keys.
+- Hermes adds the stable `hermes_complete_response` terminal definition to the
+  same agent tool loop and requires tool calling. Existing enabled tools can
+  run first. A valid completion calls the terminal tool exactly once, alone,
+  with no assistant text or other tool calls in that response.
+- Hermes validates the terminal arguments against the caller's schema before
+  accepting them. It records the terminal call and a matching tool result in
+  session history, then ends the turn. The terminal operation does not execute
+  a tool handler or request a second prose answer.
+
+Malformed tool calls, mixed terminal responses, truncated responses, final
+prose, and values that fail schema validation do not become a typed result.
+Hermes does not convert JSON-looking prose or repair the model's result to fit
+the contract. A failure does not undo tool calls from earlier loop iterations.
+
+#### Fixed session contract
+
+The first chat request on an unbound session saves its response contract before
+model execution. Send the same `response_schema` on every later typed turn;
+JSON object key order does not matter. Changing the schema or omitting it from
+a typed session returns `409 response_schema_changed`, even if the earlier
+model turn failed. To use a different contract, create a new session.
+
+Omitting `response_schema` on an unbound session binds it to ordinary freeform
+chat. That session cannot later switch to typed completion. Explicit
+`"response_schema": null` is invalid. A legacy session with no saved contract
+can adopt one while retaining its existing transcript. Typed adoption rebuilds
+the cached system prompt when needed; subsequent turns reuse the bound
+contract, and compression continuations retain it.
+
+#### Errors and streaming
+
+Typed completion uses the existing JSON error envelope, with the code in
+`error.code`:
+
+| HTTP status | Code | Meaning |
+| --- | --- | --- |
+| `400` | `invalid_response_schema` | The schema is invalid, exceeds its bounds, uses unsupported references or a different draft, or the required validator is unavailable. |
+| `409` | `response_schema_changed` | The request changes or drops the session's saved response contract. |
+| `400` | `typed_completion_streaming_unsupported` | A `/chat/stream` request includes `response_schema`. |
+| `502` | `typed_completion_invalid` | The completed agent result has no valid typed value, or the turn failed or was interrupted. The response includes `usage` and has no `typed_response` or assistant `message`. |
+
+Typed completion has no SSE path. A `/chat/stream` request without the field
+still returns `409 response_schema_changed` if that session is already typed.
+Authentication, session lookup, and request-validation errors retain their
+existing behavior.
+
+Keep the schema under trusted caller control. This feature validates result
+structure; it does not verify facts, grant permissions, change the model's
+credentials, or authorize external actions. Existing tool permissions and
+safety checks still apply, and the caller must validate the result's meaning
+and authority before acting on it.
+
 ## Skills and toolsets discovery
 
 `GET /v1/skills` and `GET /v1/toolsets` let external clients enumerate the agent's capabilities deterministically over REST instead of asking the model. Both are read-only and gated by `API_SERVER_KEY`.
