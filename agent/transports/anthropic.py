@@ -108,7 +108,8 @@ class AnthropicTransport(ProviderTransport):
 
         if kwargs.get("strict_tools"):
             from agent.typed_completion import TypedCompletionError
-            if getattr(response, "role", None) != "assistant":
+            if (getattr(response, "role", None) != "assistant"
+                    or getattr(response, "stop_reason", None) not in self._STOP_REASON_MAP):
                 raise TypedCompletionError("typed_completion_invalid_envelope")
             for block in response.content:
                 if (getattr(block, "type", None) not in {"text", "thinking", "redacted_thinking", "tool_use"}

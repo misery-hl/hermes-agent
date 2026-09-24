@@ -155,6 +155,125 @@ def test_malformed_provider_envelope_does_not_retry_or_fallback(make_agent):
     fallback.assert_not_called()
 
 
+@pytest.mark.parametrize("mode, stop_reason", [
+    ("chat_completions", None),
+    ("chat_completions", "unknown_reason"),
+    ("chat_completions", "length"),
+    ("chat_completions", "content_filter"),
+    ("anthropic_messages", None),
+    ("anthropic_messages", "unknown_reason"),
+    ("anthropic_messages", "max_tokens"),
+    ("anthropic_messages", "model_context_window_exceeded"),
+    ("anthropic_messages", "refusal"),
+    ("anthropic_messages", "pause_turn"),
+])
+def test_unfinished_terminal_reason_never_completes_retries_or_executes_tools(make_agent, mode, stop_reason):
+    make, db = make_agent
+    agent = make(mode=mode)
+    raw = response([call()], finish=stop_reason)
+    if mode == "anthropic_messages":
+        raw = SimpleNamespace(
+            role="assistant", stop_reason=stop_reason,
+            content=[SimpleNamespace(type="tool_use", id="complete-1", name=TERMINAL_TOOL_NAME, input=VALUE)],
+            usage=SimpleNamespace(input_tokens=10, output_tokens=5),
+        )
+    with patch.object(agent, "_try_activate_fallback") as fallback:
+        result, provider, lookup, summary = run(agent, [raw])
+    assert result["failed"] and not result["completed"]
+    assert "typed_response" not in result and result["final_response"] == ""
+    assert result["typed_completion_error"].startswith("typed_completion_")
+    assert provider.call_count == 1
+    assert all(message["role"] != "tool" for message in db.get_messages_as_conversation(agent.session_id))
+    lookup.assert_not_called()
+    summary.assert_not_called()
+    fallback.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", ["chat_completions", "anthropic_messages"])
+def test_missing_stop_reason_attribute_is_rejected_by_strict_normalization(mode):
+    from agent.transports.anthropic import AnthropicTransport
+    from agent.transports.chat_completions import ChatCompletionsTransport
+
+    if mode == "chat_completions":
+        raw = response([call()])
+        del raw.choices[0].finish_reason
+        transport = ChatCompletionsTransport()
+    else:
+        raw = SimpleNamespace(role="assistant", content=[
+            SimpleNamespace(type="tool_use", id="complete-1", name=TERMINAL_TOOL_NAME, input=VALUE),
+        ])
+        transport = AnthropicTransport()
+    with pytest.raises(TypedCompletionError, match="invalid_envelope"):
+        transport.normalize_response(raw, strict_tools=True)
+
+
+@pytest.mark.parametrize("mode, stop_reason", [
+    ("chat_completions", None),
+    ("chat_completions", "unknown_reason"),
+    ("anthropic_messages", None),
+    ("anthropic_messages", "unknown_reason"),
+])
+def test_untyped_stop_reason_normalization_preserves_existing_behavior(mode, stop_reason):
+    from agent.transports.anthropic import AnthropicTransport
+    from agent.transports.chat_completions import ChatCompletionsTransport
+
+    if mode == "chat_completions":
+        raw = response(None, text="Hello", finish=stop_reason)
+        normalized = ChatCompletionsTransport().normalize_response(raw)
+        assert normalized.finish_reason == (stop_reason or "stop")
+    else:
+        raw = SimpleNamespace(role="assistant", content=[SimpleNamespace(type="text", text="Hello")],
+                              stop_reason=stop_reason)
+        normalized = AnthropicTransport().normalize_response(raw)
+        assert normalized.finish_reason == "stop"
+    assert normalized.content == "Hello"
+
+
+@pytest.mark.parametrize("stop_reason, arguments, completed", [
+    (None, json.dumps(VALUE), False),
+    ("unknown_reason", json.dumps(VALUE), False),
+    ("length", json.dumps(VALUE), False),
+    ("tool_calls", '{"kind":"fact","record":"record-1",}', False),
+    ("tool_calls", json.dumps(VALUE), True),
+])
+def test_actual_chat_stream_preserves_typed_arguments_and_requires_terminal_reason(
+    make_agent, stop_reason, arguments, completed,
+):
+    make, db = make_agent
+    agent = make()
+    agent.client = None  # Exercise the actual collector, not the mock-client non-streaming path.
+    client = MagicMock()
+    client.chat.completions.create.return_value = iter([
+        SimpleNamespace(choices=[SimpleNamespace(
+            delta=SimpleNamespace(role="assistant", content=None, tool_calls=[SimpleNamespace(
+                index=0, id="complete-1", type="function",
+                function=SimpleNamespace(name=TERMINAL_TOOL_NAME, arguments=arguments),
+            )]), finish_reason=stop_reason,
+        )]),
+    ])
+    with (patch.object(agent, "_create_request_openai_client", return_value=client),
+          patch("agent.chat_completion_helpers._repair_tool_call_arguments") as repair,
+          patch("run_agent.handle_function_call") as lookup,
+          patch.object(agent, "_cleanup_task_resources"),
+          patch.object(agent, "_try_activate_fallback") as fallback,
+          patch.object(agent, "_handle_max_iterations") as summary):
+        result = agent.run_conversation("Select the saved record")
+    assert result["completed"] is completed and result["failed"] is not completed
+    assert result["final_response"] == ""
+    if completed:
+        assert result["typed_response"] == VALUE
+        assert db.get_messages_as_conversation(agent.session_id)[-1]["tool_call_id"] == "complete-1"
+    else:
+        assert "typed_response" not in result
+        assert result["typed_completion_error"].startswith("typed_completion_")
+        assert all(message["role"] != "tool" for message in db.get_messages_as_conversation(agent.session_id))
+    assert client.chat.completions.create.call_count == 1
+    repair.assert_not_called()
+    lookup.assert_not_called()
+    fallback.assert_not_called()
+    summary.assert_not_called()
+
+
 def test_invalid_completion_after_lookup_does_not_request_format_repair(make_agent):
     make, _ = make_agent
     result, provider, lookup, _ = run(make(), [response([call("lookup", '{"query":"record"}', "lookup-1")]),

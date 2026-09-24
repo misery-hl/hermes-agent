@@ -1783,6 +1783,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     def _call_chat_completions():
         """Stream a chat completions response."""
         import httpx as _httpx
+        strict_tools = getattr(agent, "_typed_completion_contract", None) is not None
         # Per-provider / per-model request_timeout_seconds (from config.yaml)
         # wins over the HERMES_API_TIMEOUT env default if the user set it.
         _provider_timeout_cfg = get_provider_request_timeout(agent.provider, agent.model)
@@ -2027,6 +2028,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             if hasattr(chunk, "usage") and chunk.usage:
                 usage_obj = chunk.usage
 
+        if strict_tools and finish_reason not in {"stop", "tool_calls", "length", "content_filter"}:
+            from agent.typed_completion import TypedCompletionError
+            raise TypedCompletionError("typed_completion_invalid_envelope")
+
         # Build mock response matching non-streaming shape
         full_content = "".join(content_parts) or None
         mock_tool_calls = None
@@ -2037,7 +2042,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 tc = tool_calls_acc[idx]
                 arguments = tc["function"]["arguments"]
                 tool_name = tc["function"]["name"] or "?"
-                if arguments and arguments.strip():
+                # Typed output must retain the provider's exact bytes. The
+                # terminal validator rejects malformed JSON without repair.
+                if not strict_tools and arguments and arguments.strip():
                     try:
                         json.loads(arguments)
                     except json.JSONDecodeError:
