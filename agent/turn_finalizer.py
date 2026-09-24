@@ -50,6 +50,18 @@ def finalize_turn(
     """
     from agent.conversation_loop import logger
 
+    typed_contract = getattr(agent, "_typed_completion_contract", None)
+    if typed_contract is not None:
+        # Typed turns never request an extra prose summary, run output
+        # transforms, or claim completion without a validated terminal call.
+        final_response = ""
+        if getattr(agent, "_typed_response", None) is None or interrupted:
+            failed = True
+            agent._typed_completion_error = (
+                getattr(agent, "_typed_completion_error", None) or "typed_completion_missing"
+            )
+            _turn_exit_reason = "typed_completion_invalid"
+
     if final_response is None and (
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
@@ -127,6 +139,8 @@ def finalize_turn(
         and api_call_count < agent.max_iterations
         and not failed
     )
+    if typed_contract is not None:
+        completed = not failed and not interrupted
 
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.
@@ -176,7 +190,7 @@ def finalize_turn(
         agent.session_id or "none",
     )
 
-    if _last_msg_role == "tool" and not interrupted:
+    if _last_msg_role == "tool" and not interrupted and typed_contract is None:
         # Agent was mid-work — this is the "just stops" case.
         logger.warning(
             "Turn ended with pending tool result (agent may appear stuck). "
@@ -227,7 +241,7 @@ def finalize_turn(
     #     an empty response, the "(empty)" terminal sentinel, or a
     #     suspiciously short partial fragment with no terminating
     #     punctuation (e.g. "The").  A real short answer keeps its text.
-    if not interrupted:
+    if not interrupted and typed_contract is None:
         try:
             if agent._turn_completion_explainer_enabled():
                 _stripped = (final_response or "").strip()
@@ -352,6 +366,11 @@ def finalize_turn(
         "cost_source": agent.session_cost_source,
         "session_id": agent.session_id,
     }
+    if typed_contract is not None:
+        if completed:
+            result["typed_response"] = agent._typed_response
+        else:
+            result["typed_completion_error"] = agent._typed_completion_error
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # If a /steer landed after the final assistant turn (no more tool

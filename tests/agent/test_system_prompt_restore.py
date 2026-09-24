@@ -31,6 +31,7 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
     agent.model = "test-model"
     agent.platform = "cli"
     agent._session_db = session_db
+    agent._typed_completion_contract = None
     agent._build_system_prompt = MagicMock(return_value=prebuilt_prompt)
     return agent
 

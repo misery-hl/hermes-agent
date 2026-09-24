@@ -24,6 +24,31 @@ class TestBedrockBasic:
 
 class TestBedrockBuildKwargs:
 
+    @pytest.mark.parametrize("selection, expected", [
+        ("required", {"any": {}}), ("any", {"any": {}}), ("auto", {"auto": {}}),
+        ({"type": "function", "function": {"name": "complete"}}, {"tool": {"name": "complete"}}),
+    ])
+    def test_tool_choice_is_forwarded_for_nova(self, transport, selection, expected):
+        tool = {"type": "function", "function": {"name": "complete", "description": "Finish", "parameters": {"type": "object"}}}
+        kwargs = transport.build_kwargs(model="us.amazon.nova-lite-v1:0", messages=[{"role": "user", "content": "Hello"}],
+                                        tools=[tool], tool_choice=selection)
+        assert kwargs["toolConfig"]["toolChoice"] == expected
+
+    @pytest.mark.parametrize("selection", ["bogus", {}, {"type": "function", "function": {"name": "missing"}}])
+    def test_invalid_tool_choice_is_rejected(self, transport, selection):
+        tool = {"type": "function", "function": {"name": "complete", "parameters": {"type": "object"}}}
+        with pytest.raises(ValueError):
+            transport.build_kwargs(model="us.amazon.nova-lite-v1:0", messages=[], tools=[tool], tool_choice=selection)
+
+    def test_required_choice_cannot_silently_strip_tools(self, transport):
+        with pytest.raises(ValueError):
+            transport.build_kwargs(model="us.amazon.nova-lite-v1:0", messages=[], tool_choice="required")
+
+    def test_none_choice_excludes_tools(self, transport):
+        tool = {"type": "function", "function": {"name": "complete", "parameters": {"type": "object"}}}
+        kwargs = transport.build_kwargs(model="us.amazon.nova-lite-v1:0", messages=[], tools=[tool], tool_choice="none")
+        assert "toolConfig" not in kwargs
+
     def test_basic_kwargs(self, transport):
         msgs = [{"role": "user", "content": "Hello"}]
         kw = transport.build_kwargs(model="anthropic.claude-3-5-sonnet-20241022-v2:0", messages=msgs)
@@ -49,6 +74,29 @@ class TestBedrockBuildKwargs:
             max_tokens=8192,
         )
         assert kw["inferenceConfig"]["maxTokens"] == 8192
+
+    @pytest.mark.parametrize("config, expected", [
+        ({"enabled": True, "effort": "low"}, {"type": "enabled", "maxReasoningEffort": "low"}),
+        ({"enabled": True, "effort": "medium"}, {"type": "enabled", "maxReasoningEffort": "medium"}),
+        ({"enabled": True, "effort": "high"}, {"type": "enabled", "maxReasoningEffort": "high"}),
+        ({"enabled": False}, {"type": "disabled"}),
+    ])
+    def test_reasoning_config_reaches_converse_adapter(self, transport, config, expected):
+        kw = transport.build_kwargs(
+            model="us.amazon.nova-2-lite-v1:0", messages=[{"role": "user", "content": "Hi"}],
+            reasoning_config=config, region="us-west-2", max_tokens=8192, temperature=0.2,
+        )
+        assert kw["additionalModelRequestFields"] == {"reasoningConfig": expected}
+        assert kw["__bedrock_region__"] == "us-west-2"
+        if expected.get("maxReasoningEffort") == "high":
+            assert "inferenceConfig" not in kw
+        else:
+            assert kw["inferenceConfig"] == {"maxTokens": 8192, "temperature": 0.2}
+
+    def test_unsupported_nova_effort_fails_before_dispatch(self, transport):
+        with pytest.raises(ValueError, match="must be low, medium, or high"):
+            transport.build_kwargs(model="us.amazon.nova-2-lite-v1:0", messages=[],
+                                   reasoning_config={"enabled": True, "effort": "xhigh"})
 
 
 class TestBedrockConvertTools:

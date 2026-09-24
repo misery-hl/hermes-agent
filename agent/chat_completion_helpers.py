@@ -228,7 +228,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     if is_stale_connection_error(_bedrock_exc):
                         invalidate_runtime_client(region)
                     raise
-                result["response"] = normalize_converse_response(raw_response)
+                result["response"] = normalize_converse_response(
+                    raw_response, strict_tools=getattr(agent, "_typed_completion_contract", None) is not None
+                )
             else:
                 request_client = _set_request_client(
                     agent._create_request_openai_client(
@@ -553,6 +555,29 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 def build_api_kwargs(agent, api_messages: list) -> dict:
+    """Build provider kwargs and enforce a caller-owned completion contract."""
+    typed_contract = getattr(agent, "_typed_completion_contract", None)
+    if typed_contract is not None:
+        from agent.typed_completion import SUPPORTED_TRANSPORTS, TypedCompletionError
+        if agent.api_mode not in SUPPORTED_TRANSPORTS:
+            raise TypedCompletionError("typed_completion_transport_unsupported")
+    kwargs = _build_api_kwargs(agent, api_messages)
+    if typed_contract is not None:
+        # Keep the full, stable tool set. The model may look up information
+        # before selecting the terminal tool in a later loop iteration.
+        if agent.api_mode == "bedrock_converse":
+            if not kwargs.get("toolConfig", {}).get("tools") or kwargs["toolConfig"].get("toolChoice") != {"any": {}}:
+                raise ValueError("typed_completion_tools_unavailable")
+        elif agent.api_mode == "anthropic_messages":
+            kwargs["tool_choice"] = {"type": "any"}
+        elif agent.api_mode == "chat_completions":
+            kwargs["tool_choice"] = "required"
+        else:
+            raise ValueError("typed_completion_transport_unsupported")
+    return kwargs
+
+
+def _build_api_kwargs(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     tools_for_api = agent.tools
 
@@ -589,8 +614,10 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             messages=api_messages,
             tools=tools_for_api,
             max_tokens=agent.max_tokens or 4096,
+            reasoning_config=agent.reasoning_config,
             region=region,
             guardrail_config=guardrail,
+            tool_choice="required" if getattr(agent, "_typed_completion_contract", None) is not None else None,
         )
 
     if agent.api_mode == "codex_responses":
@@ -1645,7 +1672,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             type(_bedrock_exc).__name__,
                         )
                         result["response"] = normalize_converse_response(
-                            client.converse(**api_kwargs)
+                            client.converse(**api_kwargs),
+                            strict_tools=getattr(agent, "_typed_completion_contract", None) is not None,
                         )
                         return
                     # Evict the cached client on stale-connection failures
@@ -1673,6 +1701,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     on_tool_start=_on_tool,
                     on_reasoning_delta=_on_reasoning if agent.reasoning_callback or agent.stream_delta_callback else None,
                     on_interrupt_check=lambda: agent._interrupt_requested,
+                    strict_tools=getattr(agent, "_typed_completion_contract", None) is not None,
                 )
             except Exception as e:
                 result["error"] = e
@@ -1755,6 +1784,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     def _call_chat_completions():
         """Stream a chat completions response."""
         import httpx as _httpx
+        strict_tools = getattr(agent, "_typed_completion_contract", None) is not None
         # Per-provider / per-model request_timeout_seconds (from config.yaml)
         # wins over the HERMES_API_TIMEOUT env default if the user set it.
         _provider_timeout_cfg = get_provider_request_timeout(agent.provider, agent.model)
@@ -1999,6 +2029,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             if hasattr(chunk, "usage") and chunk.usage:
                 usage_obj = chunk.usage
 
+        if strict_tools and finish_reason not in {"stop", "tool_calls", "length", "content_filter"}:
+            from agent.typed_completion import TypedCompletionError
+            raise TypedCompletionError("typed_completion_invalid_envelope")
+
         # Build mock response matching non-streaming shape
         full_content = "".join(content_parts) or None
         mock_tool_calls = None
@@ -2009,7 +2043,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 tc = tool_calls_acc[idx]
                 arguments = tc["function"]["arguments"]
                 tool_name = tc["function"]["name"] or "?"
-                if arguments and arguments.strip():
+                # Typed output must retain the provider's exact bytes. The
+                # terminal validator rejects malformed JSON without repair.
+                if not strict_tools and arguments and arguments.strip():
                     try:
                         json.loads(arguments)
                     except json.JSONDecodeError:

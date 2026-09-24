@@ -116,6 +116,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Required only for caller-owned typed session completion; validation never
+# degrades to an unchecked response when this extra is absent.
+typed-completion = ["jsonschema==4.26.0"]
 # Native Anthropic provider — only needed when provider=anthropic (not via
 # OpenRouter or other aggregators).
 anthropic = ["anthropic==0.87.0"]  # CVE-2026-34450, CVE-2026-34452

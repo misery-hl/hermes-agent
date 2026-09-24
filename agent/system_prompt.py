@@ -307,7 +307,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         )
 
     platform_key = (agent.platform or "").lower().strip()
-    if platform_key in PLATFORM_HINTS:
+    if getattr(agent, "_typed_completion_contract", None) is not None:
+        # The response contract owns presentation. Identity, capability and
+        # safety guidance above remain part of the same stable prompt.
+        from agent.typed_completion import TYPED_COMPLETION_GUIDANCE
+        stable_parts.append(TYPED_COMPLETION_GUIDANCE)
+    elif platform_key in PLATFORM_HINTS:
         stable_parts.append(PLATFORM_HINTS[platform_key])
     elif platform_key:
         # Check plugin registry for platform-specific LLM guidance

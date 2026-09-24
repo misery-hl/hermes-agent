@@ -517,7 +517,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     user_id TEXT,
     model TEXT,
     model_config TEXT,
+    response_schema TEXT,
     system_prompt TEXT,
+    system_prompt_contract TEXT,
     parent_session_id TEXT,
     started_at REAL NOT NULL,
     ended_at REAL,
@@ -1285,10 +1287,17 @@ class SessionDB:
     ) -> None:
         """Shared INSERT OR IGNORE for session rows."""
         def _do(conn):
+            # Compression/fork children retain the same caller-owned tool
+            # contract. SQL NULL is unbound; JSON "null" is bound freeform.
+            parent_contract = conn.execute(
+                "SELECT response_schema, system_prompt, system_prompt_contract FROM sessions "
+                "WHERE id = ? AND end_reason IN ('compression', 'branched')",
+                (parent_session_id,),
+            ).fetchone() if parent_session_id else None
             conn.execute(
                 """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
-                   system_prompt, parent_session_id, cwd, started_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   system_prompt, parent_session_id, cwd, started_at, response_schema, system_prompt_contract)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     source,
@@ -1299,9 +1308,49 @@ class SessionDB:
                     parent_session_id,
                     cwd,
                     time.time(),
+                    parent_contract[0] if parent_contract else None,
+                    parent_contract[2] if parent_contract and system_prompt == parent_contract[1] else None,
                 ),
             )
         self._execute_write(_do)
+
+    def bind_response_schema(self, session_id: str, schema: Optional[Dict[str, Any]]) -> bool:
+        """Atomically adopt a caller-owned response contract exactly once.
+
+        Legacy sessions may adopt a contract without rewriting their history.
+        This is one explicit cache-definition boundary, selected by the trusted
+        caller. A bound contract cannot change or be dropped. It is independent
+        of mutable model_config and survives compression. Returns True when a
+        typed prompt must be rebuilt. Only the cached prompt is invalidated;
+        the transcript is unchanged. Freeform cache behavior is unchanged.
+        """
+        encoded = json.dumps(schema, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT response_schema, system_prompt, system_prompt_contract FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("response_schema_session_missing")
+            saved = row[0]
+            if saved is not None and saved != encoded:
+                raise ValueError("response_schema_changed")
+            if schema is not None:
+                from agent.typed_completion import typed_prompt_cache_fingerprint
+                prompt, fingerprint = row[1], row[2]
+                if (saved is None or not isinstance(prompt, str) or not prompt
+                        or fingerprint != typed_prompt_cache_fingerprint(schema, prompt)):
+                    conn.execute(
+                        "UPDATE sessions SET response_schema = ?, system_prompt = NULL, "
+                        "system_prompt_contract = NULL WHERE id = ?", (encoded, session_id),
+                    )
+                    return True
+            elif saved is None:
+                conn.execute("UPDATE sessions SET response_schema = ? WHERE id = ?", (encoded, session_id))
+            return False
+
+        return self._execute_write(_do)
 
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
         """Create a new session record. Returns the session_id."""
@@ -1489,11 +1538,17 @@ class SessionDB:
         self._execute_write(_do)
 
     def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
-        """Store the full assembled system prompt snapshot."""
+        """Store the assembled prompt and its typed-contract provenance atomically."""
         def _do(conn):
+            row = conn.execute("SELECT response_schema FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            schema = json.loads(row[0]) if row is not None and row[0] is not None else None
+            fingerprint = None
+            if schema is not None:
+                from agent.typed_completion import typed_prompt_cache_fingerprint
+                fingerprint = typed_prompt_cache_fingerprint(schema, system_prompt)
             conn.execute(
-                "UPDATE sessions SET system_prompt = ? WHERE id = ?",
-                (system_prompt, session_id),
+                "UPDATE sessions SET system_prompt = ?, system_prompt_contract = ? WHERE id = ?",
+                (system_prompt, fingerprint, session_id),
             )
         self._execute_write(_do)
 

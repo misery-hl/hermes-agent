@@ -705,6 +705,112 @@ class TestBuildConverseKwargs:
 # Model discovery
 # ---------------------------------------------------------------------------
 
+class TestNova2Reasoning:
+    """Nova's reasoning settings must not leak into other Bedrock models."""
+
+    @pytest.mark.parametrize("effort", ["low", "medium", "high"])
+    def test_explicit_effort_and_incompatible_inference_parameters(self, effort):
+        from agent.bedrock_adapter import build_converse_kwargs
+        config = {"enabled": True, "effort": effort}
+        kwargs = build_converse_kwargs(
+            model="us.amazon.nova-2-lite-v1:0", messages=[], reasoning_config=config,
+            max_tokens=8192, temperature=0.3, top_p=0.8, stop_sequences=["END"],
+        )
+        assert kwargs["additionalModelRequestFields"] == {
+            "reasoningConfig": {"type": "enabled", "maxReasoningEffort": effort},
+        }
+        assert kwargs["inferenceConfig"] == (
+            {"stopSequences": ["END"]} if effort == "high" else
+            {"maxTokens": 8192, "temperature": 0.3, "topP": 0.8, "stopSequences": ["END"]}
+        )
+        assert config == {"enabled": True, "effort": effort}
+
+    def test_high_omits_empty_inference_config(self):
+        from agent.bedrock_adapter import build_converse_kwargs
+        kwargs = build_converse_kwargs(
+            model="us.amazon.nova-2-lite-v1:0", messages=[],
+            reasoning_config={"effort": "high"},
+        )
+        assert "inferenceConfig" not in kwargs
+
+    def test_disabled_does_not_forward_stale_effort_or_drop_limits(self):
+        from agent.bedrock_adapter import build_converse_kwargs
+        kwargs = build_converse_kwargs(
+            model="us.amazon.nova-2-lite-v1:0", messages=[],
+            reasoning_config={"enabled": False, "effort": "high"},
+            max_tokens=512, temperature=0.2, top_p=0.7,
+        )
+        assert kwargs["additionalModelRequestFields"] == {"reasoningConfig": {"type": "disabled"}}
+        assert kwargs["inferenceConfig"] == {"maxTokens": 512, "temperature": 0.2, "topP": 0.7}
+
+    @pytest.mark.parametrize("config", [None, {}])
+    def test_absent_override_preserves_provider_default(self, config):
+        from agent.bedrock_adapter import build_converse_kwargs
+        kwargs = build_converse_kwargs(
+            model="us.amazon.nova-2-lite-v1:0", messages=[], reasoning_config=config,
+        )
+        assert "additionalModelRequestFields" not in kwargs
+        assert kwargs["inferenceConfig"] == {"maxTokens": 4096}
+
+    @pytest.mark.parametrize("config", [
+        {"enabled": True}, {"effort": "minimal"}, {"effort": "xhigh"},
+        {"effort": "unknown"}, {"effort": None}, {"effort": ["medium"]},
+        {"enabled": "false", "effort": "medium"}, {"enabled": 1, "effort": "medium"},
+        {"effort": "medium", "max_tokens": 100}, "medium",
+    ])
+    def test_invalid_or_unsupported_effort_is_not_silently_converted(self, config):
+        from agent.bedrock_adapter import build_converse_kwargs
+        with pytest.raises(ValueError, match="Nova 2 Lite reasoning"):
+            build_converse_kwargs(model="us.amazon.nova-2-lite-v1:0", messages=[], reasoning_config=config)
+
+    @pytest.mark.parametrize("model", [
+        "amazon.nova-2-lite-v1:0", "us.amazon.nova-2-lite-v1:0", "global.amazon.nova-2-lite-v1:0",
+        "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-2-lite-v1:0",
+        "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.amazon.nova-2-lite-v1:0",
+    ])
+    def test_known_foundation_model_and_profile_forms(self, model):
+        from agent.bedrock_adapter import build_converse_kwargs
+        kwargs = build_converse_kwargs(model=model, messages=[], reasoning_config={"effort": "medium"})
+        assert kwargs["modelId"] == model
+        assert kwargs["additionalModelRequestFields"]["reasoningConfig"]["maxReasoningEffort"] == "medium"
+
+    @pytest.mark.parametrize("model", [
+        "us.amazon.nova-lite-v1:0", "amazon.nova-pro-v1:0", "amazon.nova-2-sonic-v1:0",
+        "us.anthropic.claude-sonnet-4-6", "meta.llama3-70b-instruct-v1:0",
+        "custom/amazon.nova-2-lite-v1:0", "amazon.nova-2-lite-v1:0-suffix",
+        "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/opaque",
+    ])
+    def test_other_models_keep_existing_request_exactly(self, model):
+        from agent.bedrock_adapter import build_converse_kwargs
+        params = {"model": model, "messages": [], "max_tokens": 1024, "temperature": 0.3, "top_p": 0.8}
+        baseline = build_converse_kwargs(**params)
+        assert build_converse_kwargs(**params, reasoning_config={"effort": "high"}) == baseline
+        assert build_converse_kwargs(**params, reasoning_config={"effort": "xhigh"}) == baseline
+
+    @pytest.mark.parametrize("streaming", [False, True])
+    def test_direct_adapter_calls_use_same_reasoning_builder(self, streaming):
+        from agent.bedrock_adapter import call_converse, call_converse_stream
+        client = MagicMock()
+        client.converse.return_value = {
+            "output": {"message": {"role": "assistant", "content": [{"text": "Done"}]}},
+            "stopReason": "end_turn",
+        }
+        client.converse_stream.return_value = {"stream": iter([
+            {"contentBlockDelta": {"delta": {"text": "Done"}}},
+            {"messageStop": {"stopReason": "end_turn"}},
+        ])}
+        with patch("agent.bedrock_adapter._get_bedrock_runtime_client", return_value=client):
+            result = (call_converse_stream if streaming else call_converse)(
+                region="us-east-1", model="us.amazon.nova-2-lite-v1:0", messages=[],
+                reasoning_config={"enabled": True, "effort": "medium"},
+            )
+        provider = client.converse_stream if streaming else client.converse
+        assert provider.call_args.kwargs["additionalModelRequestFields"] == {
+            "reasoningConfig": {"type": "enabled", "maxReasoningEffort": "medium"},
+        }
+        assert result.choices[0].message.content == "Done"
+
+
 class TestDiscoverBedrockModels:
     """Test Bedrock model discovery with mocked AWS API calls."""
 

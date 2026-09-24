@@ -607,6 +607,12 @@ class ChatCompletionsTransport(ProviderTransport):
         """
         choice = response.choices[0]
         msg = choice.message
+        if kwargs.get("strict_tools"):
+            from agent.typed_completion import TypedCompletionError
+            if (getattr(msg, "role", None) != "assistant" or len(response.choices) != 1
+                    or getattr(choice, "finish_reason", None) not in {"stop", "tool_calls", "length", "content_filter"}
+                    or any(getattr(call, "type", None) != "function" for call in (msg.tool_calls or []))):
+                raise TypedCompletionError("typed_completion_invalid_envelope")
         finish_reason = choice.finish_reason or "stop"
 
         tool_calls = None
