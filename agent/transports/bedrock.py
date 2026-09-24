@@ -43,6 +43,7 @@ class BedrockTransport(ProviderTransport):
         params:
             max_tokens: int — output token limit (default 4096)
             temperature: float | None
+            reasoning_config: dict | None — explicit Nova 2 Lite reasoning
             guardrail_config: dict | None — Bedrock guardrails
             region: str — AWS region (default 'us-east-1')
         """
@@ -57,6 +58,7 @@ class BedrockTransport(ProviderTransport):
             tools=tools,
             max_tokens=params.get("max_tokens", 4096),
             temperature=params.get("temperature"),
+            reasoning_config=params.get("reasoning_config"),
             guardrail_config=guardrail,
             tool_choice=params.get("tool_choice"),
         )

@@ -52,13 +52,14 @@ def make_agent(tmp_path, monkeypatch):
     db = SessionDB(tmp_path / "sessions.db")
     agents = []
 
-    def make(schema=SCHEMA, session_id="typed-session", mode="chat_completions", max_iterations=5):
+    def make(schema=SCHEMA, session_id="typed-session", mode="chat_completions", max_iterations=5,
+             model="test/model", reasoning_config=None):
         with (patch("run_agent.get_tool_definitions", return_value=[copy.deepcopy(LOOKUP)]),
               patch("run_agent.check_toolset_requirements", return_value={}), patch("run_agent.OpenAI")):
-            agent = AIAgent(api_key="test-key-only", base_url="https://example.invalid/v1", model="test/model",
+            agent = AIAgent(api_key="test-key-only", base_url="https://example.invalid/v1", model=model,
                             quiet_mode=True, skip_context_files=True, skip_memory=True, tool_delay=0,
                             session_db=db, session_id=session_id, response_schema=schema,
-                            max_iterations=max_iterations)
+                            max_iterations=max_iterations, reasoning_config=reasoning_config)
         agent.api_mode = mode
         agent.client = MagicMock()
         agent._cached_system_prompt = "Use lookup when needed, then complete the requested response."
@@ -622,6 +623,43 @@ def test_real_bedrock_envelope_after_lookup_completes_and_preserves_usage(make_a
     provider = client.converse_stream if streaming else client.converse
     assert provider.call_count == 2
     assert provider.call_args.kwargs["toolConfig"]["toolChoice"] == {"any": {}}
+    assert db.get_messages_as_conversation(agent.session_id)[-1]["tool_call_id"] == "terminal-1"
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "none"])
+def test_configured_nova2_reasoning_survives_lookup_and_typed_completion(make_agent, tmp_path, monkeypatch, streaming, effort):
+    import gateway.run as gateway_run
+
+    config_home = tmp_path / "home"
+    config_home.mkdir(exist_ok=True)
+    (config_home / "config.yaml").write_text(f"agent:\n  reasoning_effort: {effort}\n", encoding="utf-8")
+    monkeypatch.setattr(gateway_run, "_hermes_home", config_home)
+    config = gateway_run.GatewayRunner._load_reasoning_config()
+    make, db = make_agent
+    agent = make(mode="bedrock_converse", model="us.amazon.nova-2-lite-v1:0", reasoning_config=config)
+    agent.max_tokens = 8192
+    if streaming:
+        replies = [bedrock_events('{"query":"record"}', "lookup", "lookup-1"), bedrock_events(json.dumps(VALUE))]
+    else:
+        replies = [bedrock_reply([bedrock_tool("lookup", {"query":"record"}, "lookup-1")]), bedrock_reply([bedrock_tool()])]
+    result, client, lookup = run_bedrock(agent, replies, streaming)
+    provider = client.converse_stream if streaming else client.converse
+    expected = {"type": "disabled"} if effort == "none" else {"type": "enabled", "maxReasoningEffort": effort}
+    assert result["completed"] and result["typed_response"] == VALUE
+    assert provider.call_count == 2 and lookup.call_count == 1
+    requests = [call.kwargs for call in provider.call_args_list]
+    for request in requests:
+        assert request["additionalModelRequestFields"] == {"reasoningConfig": expected}
+        assert request["toolConfig"]["toolChoice"] == {"any": {}}
+        assert {tool["toolSpec"]["name"] for tool in request["toolConfig"]["tools"]} == {"lookup", TERMINAL_TOOL_NAME}
+        if effort == "high":
+            assert "inferenceConfig" not in request
+        else:
+            assert request["inferenceConfig"] == {"maxTokens": 8192}
+    assert requests[0]["system"] == requests[1]["system"]
+    assert requests[0]["toolConfig"] == requests[1]["toolConfig"]
+    assert result["api_calls"] == 2 and result["total_tokens"] == 30
     assert db.get_messages_as_conversation(agent.session_id)[-1]["tool_call_id"] == "terminal-1"
 
 

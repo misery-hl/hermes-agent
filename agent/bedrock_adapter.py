@@ -983,6 +983,36 @@ def stream_converse_with_callbacks(
 # High-level API: call Bedrock Converse
 # ---------------------------------------------------------------------------
 
+def _nova2_reasoning_config(model: str, config: Optional[Dict]) -> Optional[Dict]:
+    """Translate explicit Hermes reasoning settings for Nova 2 Lite only.
+
+    No override preserves the provider default. Other Bedrock families retain
+    their existing behavior; their reasoning contracts are not interchangeable.
+    Hermes' generic minimal/xhigh levels have no Nova equivalent, so reject them
+    rather than silently changing the requested effort or cost.
+    """
+    model_id = model
+    arn = re.fullmatch(
+        r"arn:[^:]+:bedrock:[^:]+:[0-9]*:(?:foundation-model|inference-profile)/(.+)",
+        model_id,
+    )
+    if arn:
+        model_id = arn.group(1)
+    if not re.fullmatch(r"(?:(?:us|eu|global|apac|ap|jp)\.)?amazon\.nova-2-lite-v1:0", model_id):
+        return None
+    if config is None or config == {}:
+        return None
+    if (not isinstance(config, dict) or set(config) - {"enabled", "effort"}
+            or ("enabled" in config and type(config["enabled"]) is not bool)):
+        raise ValueError("Nova 2 Lite reasoning requires enabled and/or effort settings")
+    if config.get("enabled") is False:
+        return {"type": "disabled"}
+    effort = config.get("effort")
+    if effort not in ("low", "medium", "high"):
+        raise ValueError("Nova 2 Lite reasoning effort must be low, medium, or high")
+    return {"type": "enabled", "maxReasoningEffort": effort}
+
+
 def build_converse_kwargs(
     model: str,
     messages: List[Dict],
@@ -993,27 +1023,33 @@ def build_converse_kwargs(
     stop_sequences: Optional[List[str]] = None,
     guardrail_config: Optional[Dict] = None,
     tool_choice: Optional[Any] = None,
+    reasoning_config: Optional[Dict] = None,
 ) -> Dict[str, Any]:
     """Build kwargs for ``bedrock-runtime.converse()`` or ``converse_stream()``.
 
-    Converts OpenAI-format inputs to Converse API parameters.
+    Converts OpenAI-format inputs to Converse API parameters. Explicit Nova 2
+    Lite reasoning uses additionalModelRequestFields.reasoningConfig. High
+    effort requires maxTokens and sampling parameters to be omitted:
+    https://docs.aws.amazon.com/nova/latest/nova2-userguide/extended-thinking.html
     """
+    reasoning = _nova2_reasoning_config(model, reasoning_config)
+    high_reasoning = reasoning is not None and reasoning.get("maxReasoningEffort") == "high"
     system_prompt, converse_messages = convert_messages_to_converse(messages)
 
     kwargs: Dict[str, Any] = {
         "modelId": model,
         "messages": converse_messages,
-        "inferenceConfig": {
-            "maxTokens": max_tokens,
-        },
+        "inferenceConfig": {} if high_reasoning else {"maxTokens": max_tokens},
     }
+    if reasoning is not None:
+        kwargs["additionalModelRequestFields"] = {"reasoningConfig": reasoning}
 
     if system_prompt:
         kwargs["system"] = system_prompt
 
     from agent.anthropic_adapter import _forbids_sampling_params
 
-    if not _forbids_sampling_params(model):
+    if not high_reasoning and not _forbids_sampling_params(model):
         if temperature is not None:
             kwargs["inferenceConfig"]["temperature"] = temperature
 
@@ -1022,6 +1058,8 @@ def build_converse_kwargs(
 
     if stop_sequences:
         kwargs["inferenceConfig"]["stopSequences"] = stop_sequences
+    if not kwargs["inferenceConfig"]:
+        kwargs.pop("inferenceConfig")
 
     if tools and tool_choice != "none":
         converse_tools = convert_tools_to_converse(tools)
@@ -1074,6 +1112,7 @@ def call_converse(
     top_p: Optional[float] = None,
     stop_sequences: Optional[List[str]] = None,
     guardrail_config: Optional[Dict] = None,
+    reasoning_config: Optional[Dict] = None,
 ) -> SimpleNamespace:
     """Call Bedrock Converse API (non-streaming) and return an OpenAI-compatible response.
 
@@ -1089,6 +1128,7 @@ def call_converse(
         top_p=top_p,
         stop_sequences=stop_sequences,
         guardrail_config=guardrail_config,
+        reasoning_config=reasoning_config,
     )
 
     try:
@@ -1115,6 +1155,7 @@ def call_converse_stream(
     top_p: Optional[float] = None,
     stop_sequences: Optional[List[str]] = None,
     guardrail_config: Optional[Dict] = None,
+    reasoning_config: Optional[Dict] = None,
 ) -> SimpleNamespace:
     """Call Bedrock ConverseStream API and return an OpenAI-compatible response.
 
@@ -1131,6 +1172,7 @@ def call_converse_stream(
         top_p=top_p,
         stop_sequences=stop_sequences,
         guardrail_config=guardrail_config,
+        reasoning_config=reasoning_config,
     )
 
     try:

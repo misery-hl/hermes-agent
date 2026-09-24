@@ -614,6 +614,7 @@ def _build_api_kwargs(agent, api_messages: list) -> dict:
             messages=api_messages,
             tools=tools_for_api,
             max_tokens=agent.max_tokens or 4096,
+            reasoning_config=agent.reasoning_config,
             region=region,
             guardrail_config=guardrail,
             tool_choice="required" if getattr(agent, "_typed_completion_contract", None) is not None else None,

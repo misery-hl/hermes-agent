@@ -75,6 +75,29 @@ class TestBedrockBuildKwargs:
         )
         assert kw["inferenceConfig"]["maxTokens"] == 8192
 
+    @pytest.mark.parametrize("config, expected", [
+        ({"enabled": True, "effort": "low"}, {"type": "enabled", "maxReasoningEffort": "low"}),
+        ({"enabled": True, "effort": "medium"}, {"type": "enabled", "maxReasoningEffort": "medium"}),
+        ({"enabled": True, "effort": "high"}, {"type": "enabled", "maxReasoningEffort": "high"}),
+        ({"enabled": False}, {"type": "disabled"}),
+    ])
+    def test_reasoning_config_reaches_converse_adapter(self, transport, config, expected):
+        kw = transport.build_kwargs(
+            model="us.amazon.nova-2-lite-v1:0", messages=[{"role": "user", "content": "Hi"}],
+            reasoning_config=config, region="us-west-2", max_tokens=8192, temperature=0.2,
+        )
+        assert kw["additionalModelRequestFields"] == {"reasoningConfig": expected}
+        assert kw["__bedrock_region__"] == "us-west-2"
+        if expected.get("maxReasoningEffort") == "high":
+            assert "inferenceConfig" not in kw
+        else:
+            assert kw["inferenceConfig"] == {"maxTokens": 8192, "temperature": 0.2}
+
+    def test_unsupported_nova_effort_fails_before_dispatch(self, transport):
+        with pytest.raises(ValueError, match="must be low, medium, or high"):
+            transport.build_kwargs(model="us.amazon.nova-2-lite-v1:0", messages=[],
+                                   reasoning_config={"enabled": True, "effort": "xhigh"})
+
 
 class TestBedrockConvertTools:
 
